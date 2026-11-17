@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CloudDetectX</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2 4 7v8c0 7.5 5.1 13.4 12 15 6.9-1.6 12-7.5 12-15V7z' fill='%232a78d6'/%3E%3Cpath d='m11 16 3.5 3.5L21.5 12' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" aria-label="Navigation">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2 4 7v8c0 7.5 5.1 13.4 12 15 6.9-1.6 12-7.5 12-15V7z"/><path class="tick" d="m11 16 3.5 3.5L21.5 12"/></svg>
+        <div><strong>CloudDetectX</strong><span>Find it · Prove it · Seal it</span></div>
+      </div>
+      <nav class="nav">
+        <a href="#/dashboard" data-nav="dashboard">Dashboard</a>
+        <a href="#/respond" data-nav="respond">Incident response</a>
+        <a href="#/iam" data-nav="iam">Identity &amp; access</a>
+        <a href="#/compliance" data-nav="compliance">Compliance</a>
+        <a href="#/history" data-nav="history">History</a>
+        <a href="#/reports" data-nav="reports">Reports</a>
+        <a href="#/settings" data-nav="settings">Settings</a>
+      </nav>
+      <div class="clouds-title">Clouds</div>
+      <div id="clouds" class="clouds"></div>
+      <div class="sidebar-foot" id="foot"></div>
+    </aside>
+    <main id="main" class="main" tabindex="-1"><div class="loading">Loading...</div></main>
+  </div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <div id="tip" class="tip" role="tooltip" hidden></div>
+  <dialog id="dialog"></dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>
