@@ -1,5 +1,10 @@
 # 🛡️ CloudDetectX
 
+[![PyPI](https://img.shields.io/pypi/v/clouddetectx)](https://pypi.org/project/clouddetectx/)
+[![Python](https://img.shields.io/pypi/pyversions/clouddetectx)](https://pypi.org/project/clouddetectx/)
+[![Tests](https://github.com/dipanshwave/CloudDetectX-exposure-detector/actions/workflows/tests.yml/badge.svg)](https://github.com/dipanshwave/CloudDetectX-exposure-detector/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/dipanshwave/CloudDetectX-exposure-detector/blob/main/LICENSE)
+
 > **Find it. Prove it. Seal it.** Find exposed cloud storage and risky account settings, prove what's reachable and what's inside, see who got in, and fix it, with a report at the end.
 
 CloudDetectX checks **AWS, Azure and Google Cloud** for misconfigurations using your existing cloud logins. It runs as a local **web dashboard**, an **interactive terminal UI**, or **scriptable commands**.
@@ -26,38 +31,38 @@ CloudDetectX checks **AWS, Azure and Google Cloud** for misconfigurations using 
 
 ## Quick start
 
+Requires Python 3.10 or newer.
+
 ```bash
-git clone https://github.com/dipanshwave/CloudDetectX-exposure-detector
-cd CloudDetectX-exposure-detector
-python -m venv .venv
-.venv\Scripts\activate            # Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt   # or: pip install .   (adds a `clouddetectx` command)
-python main.py web                # dashboard; the first visit opens the setup wizard
+pip install clouddetectx          # or: pipx install clouddetectx (keeps it in its own environment)
+clouddetectx web                  # dashboard; the first visit opens the setup wizard
 ```
 
-Everything is configured in the app: the setup wizard, **Settings** (web or terminal), or `python main.py config`. Settings go to `.env` (git-ignored). Secrets such as the webhook URL go to your **OS keychain** when one is available. When installed with pip, settings live in `%APPDATA%\clouddetectx` (Windows) or `~/.config/clouddetectx`.
+Upgrade later with `pip install -U clouddetectx`.
+
+Everything is configured in the app: the setup wizard, **Settings** (web or terminal), or `clouddetectx config`. Settings are saved in `%APPDATA%\clouddetectx` (Windows) or `~/.config/clouddetectx` (Linux/macOS); set `CLOUDDETECTX_HOME` to use another folder. Secrets such as the webhook URL go to your **OS keychain** when one is available.
 
 ## Usage
 
 ```bash
-python main.py web                            # web dashboard at http://127.0.0.1:8765
-python main.py                                # interactive terminal menus
+clouddetectx web                            # web dashboard at http://127.0.0.1:8765
+clouddetectx                                # interactive terminal menus
 
-python main.py -p aws,azure,gcp scan          # scan + account checks + drift + alerts
-python main.py -p aws scan --all-accounts     # every Organizations account / subscription / project
-python main.py -p aws account                 # IAM and account-wide findings
-python main.py -p aws verify my-bucket        # test from the internet, no credentials
-python main.py -p aws discover my-bucket      # find secrets / personal data (redacted)
-python main.py -p aws investigate my-bucket --days 90
-python main.py -p aws remediate my-bucket --dry-run
-python main.py rollback INC-20261118-054001-aws-my-bucket
-python main.py -p aws waivers add my-website --check '*' --reason "public website" --expires 2027-06-30
-python main.py -p aws compliance --report --pdf
-python main.py -p aws export --format sarif -o findings.sarif   # also: ocsf, csv, all
-python main.py -p aws schedule install --every 1440             # daily scan via Task Scheduler / cron
+clouddetectx -p aws,azure,gcp scan          # scan + account checks + drift + alerts
+clouddetectx -p aws scan --all-accounts     # every Organizations account / subscription / project
+clouddetectx -p aws account                 # IAM and account-wide findings
+clouddetectx -p aws verify my-bucket        # test from the internet, no credentials
+clouddetectx -p aws discover my-bucket      # find secrets / personal data (redacted)
+clouddetectx -p aws investigate my-bucket --days 90
+clouddetectx -p aws remediate my-bucket --dry-run
+clouddetectx rollback INC-20261118-054001-aws-my-bucket
+clouddetectx -p aws waivers add my-website --check '*' --reason "public website" --expires 2027-06-30
+clouddetectx -p aws compliance --report --pdf
+clouddetectx -p aws export --format sarif -o findings.sarif   # also: ocsf, csv, all
+clouddetectx -p aws schedule install --every 1440             # daily scan via Task Scheduler / cron
 ```
 
-Exit codes: `0` nothing exposed, `2` exposure found, `1` error. Run `python main.py <command> --help` for options.
+Exit codes: `0` nothing exposed, `2` exposure found, `1` error. Run `clouddetectx <command> --help` for options.
 
 ## Screenshots
 
@@ -88,7 +93,7 @@ More are in [docs/screenshots](https://github.com/dipanshwave/CloudDetectX-expos
 
 **All accounts**: AWS needs `organizations:ListAccounts` in the management (or delegated admin) account, plus a read-only role in each member account (set its name under *Settings > AWS*). Azure and GCP use every subscription/project your login can read.
 
-**First real run:** start with `python main.py whoami`, then a read-only `scan`. If a check lacks permission it is skipped and listed, never fatal. Limit account checks to the regions you use under *Settings > AWS > Regions for account checks* for faster scans.
+**First real run:** start with `clouddetectx whoami`, then a read-only `scan`. If a check lacks permission it is skipped and listed, never fatal. Limit account checks to the regions you use under *Settings > AWS > Regions for account checks* for faster scans.
 
 ## Limits
 
@@ -99,26 +104,3 @@ More are in [docs/screenshots](https://github.com/dipanshwave/CloudDetectX-expos
 
 ## Development
 
-```bash
-pip install -r requirements.txt -r requirements-dev.txt
-python -m pytest              # 45 tests; AWS is simulated with moto, nothing touches real clouds
-```
-
-CI runs the suite on Linux and Windows ([.github/workflows/tests.yml](https://github.com/dipanshwave/CloudDetectX-exposure-detector/blob/main/.github/workflows/tests.yml)).
-
-```text
-clouddetectx/
-├── providers/      aws.py, azure.py, gcp.py (storage checks, remediation, rollback)
-├── checks/         account-wide checks and Azure/GCP IAM
-├── web/            local dashboard (FastAPI + plain JS)
-├── cli.py          commands          interactive.py  terminal UI
-├── engine.py       scan workflow     waivers.py      accepted risks
-├── iam.py          AWS IAM analysis  sensitive.py    data discovery
-├── compliance.py   control maps      reporting.py    reports
-├── export.py       SARIF/OCSF/CSV/PDF  schedule.py   scheduled scans
-└── ...             state, history, risk, alerts, probe, analysis
-```
-
----
-
-MIT licensed. For **authorised use only**: scan only accounts you own or have permission to assess.
