@@ -56,7 +56,7 @@ class GCPProvider(StorageProvider):
     name = "gcp"
     display_name = "Google Cloud (Cloud Storage)"
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, project: str | None = None):
         try:
             from google.auth.exceptions import DefaultCredentialsError
             from google.cloud import storage
@@ -64,7 +64,7 @@ class GCPProvider(StorageProvider):
             raise ProviderError("Google Cloud SDK is not installed. Run: pip install -r requirements.txt") from exc
         self.settings = settings
         try:
-            self.client = storage.Client(project=settings.gcp_project)
+            self.client = storage.Client(project=project or settings.gcp_project)
         except DefaultCredentialsError as exc:
             raise ProviderError(
                 "No Google Cloud credentials found. Run `gcloud auth application-default login` "
@@ -96,10 +96,38 @@ class GCPProvider(StorageProvider):
     def account_label(self) -> str:
         return f"GCP project {self.project}"
 
+    def account_id(self) -> str:
+        return self.project
+
+    def list_accounts(self) -> list[dict]:
+        from clouddetectx.checks.rest import GcpRest, RestError
+
+        try:
+            projects = GcpRest().list("https://cloudresourcemanager.googleapis.com/v1/projects", "projects",
+                                      {"filter": "lifecycleState:ACTIVE"})
+        except RestError as exc:
+            raise ProviderError(f"Cannot list GCP projects: {exc}") from exc
+        return [{"id": p["projectId"], "name": p.get("name") or p["projectId"]} for p in projects]
+
+    def for_account(self, account_id: str) -> "GCPProvider":
+        if account_id == self.project:
+            return self
+        return GCPProvider(self.settings, project=account_id)
+
+    def account_checks(self):
+        from clouddetectx.checks import gcp_account
+
+        return gcp_account.run(self)
+
+    def analyze_identity(self):
+        from clouddetectx.checks import gcp_account
+
+        return gcp_account.analyze_identity(self)
+
     # -- discovery ----------------------------------------------------------------
     def _resource(self, bucket) -> Resource:
         return Resource(provider="gcp", name=bucket.name, resource_id=f"gs://{bucket.name}",
-                        location=(bucket.location or "").lower() or None)
+                        location=(bucket.location or "").lower() or None, account=self.project)
 
     def list_resources(self) -> list[Resource]:
         return [self._resource(b) for b in self._call(lambda: list(self.client.list_buckets()), "list buckets")]
@@ -125,7 +153,14 @@ class GCPProvider(StorageProvider):
         cfg["versioning"] = bool(bucket.versioning_enabled)
         cfg["logging"] = bucket.get_logging()
         cfg["retention_policy"] = bool(bucket.retention_period)
+        cfg["retention_locked"] = bool(getattr(bucket, "retention_policy_locked", False))
         cfg["default_kms_key"] = bucket.default_kms_key_name
+        cfg["encryption_summary"] = {
+            "at_rest": "Customer-managed key (Cloud KMS)" if bucket.default_kms_key_name else "Google-managed keys",
+            "kms_key": bucket.default_kms_key_name, "bucket_key": None,
+            "in_transit_enforced": True,          # the Cloud Storage JSON/XML APIs are HTTPS-only
+            "object_lock": cfg["retention_locked"],
+        }
 
         try:
             policy = bucket.get_iam_policy(requested_policy_version=3)
@@ -240,6 +275,11 @@ class GCPProvider(StorageProvider):
                              "logs downloads by the public cannot be detected."),
                 recommendation="Enable usage logs: gcloud storage buckets update gs://BUCKET --log-bucket=gs://LOG_BUCKET",
             ))
+
+        if not cfg.get("retention_policy"):
+            findings.append(Finding("GCP-GCS-009", "No retention policy", Severity.INFO,
+                                    "Objects can be deleted at any time by anyone with delete permission.",
+                                    "For backups and audit data, set (and optionally lock) a retention policy."))
 
         if not cfg.get("versioning") and not cfg.get("retention_policy"):
             findings.append(Finding("GCP-GCS-007", "Object versioning is disabled", Severity.LOW,
@@ -392,15 +432,15 @@ class GCPProvider(StorageProvider):
         actions: list[RemediationAction] = []
         bucket = self.client.bucket(posture.resource.name)
 
-        def run(action: str, detail: str, before: Any, fn):
+        def run(action: str, detail: str, before: Any, fn, op: str = "", target: str = ""):
             if dry_run:
-                actions.append(RemediationAction(action, "planned", detail, before))
+                actions.append(RemediationAction(action, "planned", detail, before, op, target))
                 return
             try:
                 fn()
-                actions.append(RemediationAction(action, "applied", detail, before))
+                actions.append(RemediationAction(action, "applied", detail, before, op, target))
             except GoogleAPIError as exc:
-                actions.append(RemediationAction(action, "failed", f"{detail} -> {exc}", before))
+                actions.append(RemediationAction(action, "failed", f"{detail} -> {exc}", before, op, target))
 
         # 1. Containment: enforced Public Access Prevention blocks allUsers/allAuthenticatedUsers everywhere.
         if cfg.get("public_access_prevention") != "enforced":
@@ -409,7 +449,7 @@ class GCPProvider(StorageProvider):
                 bucket.iam_configuration.public_access_prevention = "enforced"
                 bucket.patch()
             run("Enforce Public Access Prevention", "publicAccessPrevention=enforced",
-                {"public_access_prevention": cfg.get("public_access_prevention")}, enforce_pap)
+                {"public_access_prevention": cfg.get("public_access_prevention")}, enforce_pap, "gcs.pap")
 
         # 2. Remove public members from IAM bindings.
         if _public_bindings(cfg.get("iam_bindings", [])):
@@ -420,7 +460,7 @@ class GCPProvider(StorageProvider):
                 policy.bindings = [b for b in policy.bindings if b["members"]]
                 bucket.set_iam_policy(policy)
             run("Remove allUsers/allAuthenticatedUsers from bucket IAM",
-                "storage.buckets.setIamPolicy", cfg.get("iam_bindings"), strip_iam)
+                "storage.buckets.setIamPolicy", cfg.get("iam_bindings"), strip_iam, "gcs.iam")
 
         # 3. Remove public ACL entries (bucket + sampled objects).
         def revoke(acl):
@@ -433,10 +473,10 @@ class GCPProvider(StorageProvider):
 
         if cfg.get("public_acl_entries"):
             run("Remove public entries from the bucket ACL", "bucket ACL save",
-                cfg["public_acl_entries"], lambda: revoke(bucket.acl))
+                cfg["public_acl_entries"], lambda: revoke(bucket.acl), "gcs.bucket_acl")
         for obj in cfg.get("public_objects", []):
             run(f"Remove public entries from object ACL: {obj['key']}", "object ACL save",
-                obj["entries"], lambda k=obj["key"]: revoke(bucket.blob(k).acl))
+                obj["entries"], lambda k=obj["key"]: revoke(bucket.blob(k).acl), "gcs.object_acl", obj["key"])
 
         if harden:
             if not cfg.get("uniform_bucket_level_access"):
@@ -444,14 +484,72 @@ class GCPProvider(StorageProvider):
                     bucket.reload()
                     bucket.iam_configuration.uniform_bucket_level_access_enabled = True
                     bucket.patch()
-                run("Enable uniform bucket-level access", "Disables all ACLs on the bucket", False, enable_ubla)
+                run("Enable uniform bucket-level access", "Disables all ACLs on the bucket", False, enable_ubla, "gcs.ubla")
             if not cfg.get("versioning"):
                 def enable_versioning():
                     bucket.reload()
                     bucket.versioning_enabled = True
                     bucket.patch()
-                run("Enable object versioning", "versioning.enabled=true", False, enable_versioning)
+                run("Enable object versioning", "versioning.enabled=true", False, enable_versioning, "gcs.versioning")
 
         if not actions:
             actions.append(RemediationAction("No change required", "skipped", "No public access to remove."))
         return actions
+
+    def rollback(self, resource: Resource, applied: list[dict], dry_run: bool):
+        from google.api_core.exceptions import GoogleAPIError
+
+        bucket = self.client.bucket(resource.name)
+        out: list[RemediationAction] = []
+
+        def set_pap(value):
+            bucket.reload()
+            bucket.iam_configuration.public_access_prevention = value or "inherited"
+            bucket.patch()
+
+        def set_iam(bindings):
+            policy = bucket.get_iam_policy(requested_policy_version=3)
+            policy.bindings = [{"role": b["role"], "members": set(b["members"]),
+                                **({"condition": b["condition"]} if b.get("condition") else {})} for b in bindings or []]
+            bucket.set_iam_policy(policy)
+
+        def restore_acl(acl, entries):
+            acl.reload()
+            for e in entries or []:
+                entity = acl.all() if e.get("entity") == "allUsers" else acl.all_authenticated()
+                {"READER": entity.grant_read, "WRITER": entity.grant_write, "OWNER": entity.grant_owner}.get(
+                    e.get("role"), entity.grant_read)()
+            acl.save()
+
+        def set_flag(attr, value):
+            bucket.reload()
+            if attr == "ubla":
+                bucket.iam_configuration.uniform_bucket_level_access_enabled = value
+            else:
+                bucket.versioning_enabled = value
+            bucket.patch()
+
+        for a in applied:
+            op, before, target = a.get("op"), a.get("before"), a.get("target") or ""
+            title = f"Undo: {a.get('action')}"
+            fns = {
+                "gcs.pap": (lambda b=before: set_pap((b or {}).get("public_access_prevention")), "Restore Public Access Prevention"),
+                "gcs.iam": (lambda b=before: set_iam(b), "Restore previous bucket IAM bindings"),
+                "gcs.bucket_acl": (lambda b=before: restore_acl(bucket.acl, b), "Restore public bucket ACL entries"),
+                "gcs.object_acl": (lambda b=before, k=target: restore_acl(bucket.blob(k).acl, b), f"Restore ACL on {target}"),
+                "gcs.ubla": (lambda: set_flag("ubla", False), "Disable uniform bucket-level access (possible for 90 days)"),
+                "gcs.versioning": (lambda: set_flag("versioning", False), "Disable object versioning"),
+            }
+            if op not in fns:
+                out.append(RemediationAction(title, "skipped", "No automatic undo for this action.", before, op or "", target))
+                continue
+            fn, detail = fns[op]
+            if dry_run:
+                out.append(RemediationAction(title, "planned", detail, before, op, target))
+                continue
+            try:
+                fn()
+                out.append(RemediationAction(title, "applied", detail, before, op, target))
+            except GoogleAPIError as exc:
+                out.append(RemediationAction(title, "failed", f"{detail} -> {exc}", before, op, target))
+        return out

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -13,6 +15,7 @@ from clouddetectx.probe import ExposureProof, run_probes
 from clouddetectx.providers.base import ProviderError, StorageProvider
 from clouddetectx.risk import RiskScore, posture_score, score_resource
 from clouddetectx.sensitive import EMAIL_BULK_THRESHOLD, SensitiveReport, discover
+from clouddetectx.waivers import WaiverStore
 
 
 @dataclass
@@ -22,6 +25,7 @@ class ScanResult:
     sensitive: SensitiveReport | None = None
     proof: ExposureProof | None = None
     data_findings: list[Finding] = field(default_factory=list)
+    accepted: list[Finding] = field(default_factory=list)    # covered by an accepted-risk waiver
 
     @property
     def exposed(self) -> bool:
@@ -31,6 +35,8 @@ class ScanResult:
     def status(self) -> str:
         if self.exposed:
             return "public"
+        if any(f.exposes_data for f in self.accepted):
+            return "accepted"            # public on purpose (waived), e.g. website assets
         mitigated = any(f.evidence and not f.exposes_data and f.check_id.endswith(("001", "002", "003"))
                         for f in self.findings)
         return "mitigated" if mitigated else "private"
@@ -77,21 +83,91 @@ class SecurityEngine:
     def __init__(self, provider: StorageProvider, settings: Settings):
         self.provider = provider
         self.settings = settings
+        self.waivers = WaiverStore(settings.data_dir)
+
+    # -- waivers --------------------------------------------------------------------
+    def apply_waivers(self, result: ScanResult) -> ScanResult:
+        res = result.posture.resource
+        pool = result.findings + result.data_findings + result.accepted
+        active, waived = self.waivers.split(res.provider, res.name, pool)
+        result.findings = [f for f in active if not f.check_id.startswith("DATA-")]
+        result.data_findings = [f for f in active if f.check_id.startswith("DATA-")]
+        result.accepted = waived
+        return result
+
+    def apply_account_waivers(self, review) -> None:
+        active, waived = self.waivers.split(review.provider, review.waiver_resource, review.findings + review.waived)
+        review.findings, review.waived = active, waived
+        if review.iam is not None:
+            review.iam.findings = [f for f in active if f.check_id.startswith(("AWS-IAM-", "AZ-IAM-", "GCP-IAM-"))]
 
     # -- detect ---------------------------------------------------------------------
+    def _scan_resource(self, res) -> ScanResult:
+        try:
+            posture = self.provider.collect_posture(res)
+            findings = self.provider.evaluate(posture)
+        except ProviderError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one broken bucket must not abort an account-wide scan
+            from clouddetectx.models import Posture
+
+            posture = Posture(resource=res, errors={"scan": f"{type(exc).__name__}: {exc}"})
+            findings = [Finding("SCAN-000", "Could not scan this resource", Severity.INFO,
+                                f"{type(exc).__name__}: {str(exc)[:300]}",
+                                "Check the scanner's permissions and re-scan this resource.")]
+        return self.apply_waivers(ScanResult(posture, findings))
+
     def scan_one(self, name: str) -> ScanResult:
-        posture = self.provider.collect_posture(self.provider.get_resource(name))
-        return ScanResult(posture, self.provider.evaluate(posture))
+        return self._scan_resource(self.provider.get_resource(name))
 
     def scan(self, names: list[str] | None = None, on_progress: Callable[[str], None] | None = None) -> list[ScanResult]:
         resources = [self.provider.get_resource(n) for n in names] if names else self.provider.list_resources()
-        results = []
-        for res in resources:
+        workers = max(1, min(self.settings.scan_workers, len(resources)))
+        lock = threading.Lock()
+
+        def work(res):
             if on_progress:
-                on_progress(res.name)
-            posture = self.provider.collect_posture(res)
-            results.append(ScanResult(posture, self.provider.evaluate(posture)))
-        return results
+                with lock:
+                    on_progress(res.name)
+            return self._scan_resource(res)
+
+        if workers == 1:
+            return [work(r) for r in resources]
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="clouddetectx-scan") as pool:
+            return list(pool.map(work, resources))      # keeps listing order
+
+    # -- account-level review (IAM + account-wide checks) ------------------------------
+    def review_account(self, on_progress: Callable[[str], None] | None = None):
+        """AccountReview for the provider's account, or None when account checks are switched off."""
+        from clouddetectx.account import AccountReview
+
+        if not self.settings.account_checks:
+            return None
+        review = AccountReview(self.provider.name, self.provider.account_id())
+        if on_progress:
+            on_progress("Analysing IAM permissions")
+        try:
+            review.iam = self.provider.analyze_identity()
+        except ProviderError as exc:
+            review.errors["iam"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 - never let one area break the review
+            review.errors["iam"] = f"{type(exc).__name__}: {exc}"
+        if review.iam is not None:
+            review.findings += review.iam.findings
+            review.notes += review.iam.notes
+        if on_progress:
+            on_progress("Checking account-wide settings")
+        try:
+            findings, notes, errors = self.provider.account_checks()
+            review.findings += findings
+            review.notes += notes
+            review.errors.update(errors)
+        except ProviderError as exc:
+            review.errors["account"] = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            review.errors["account"] = f"{type(exc).__name__}: {exc}"
+        self.apply_account_waivers(review)
+        return review
 
     # -- discover / verify -------------------------------------------------------------
     def discover(self, result: ScanResult, on_progress: Callable[[str], None] | None = None) -> SensitiveReport:
@@ -105,11 +181,13 @@ class SecurityEngine:
             max_objects=s.discovery_max_objects,
             max_bytes=s.discovery_max_kb * 1024,
             max_total_bytes=s.discovery_max_total_mb * 1024 * 1024,
+            max_file_bytes=s.discovery_max_file_mb * 1024 * 1024,
             on_progress=on_progress,
             notes=notes,
         )
         result.sensitive = report
         result.data_findings = data_findings_from(report, result.exposed)
+        self.apply_waivers(result)
         return report
 
     def verify_exposure(self, result: ScanResult) -> ExposureProof:
@@ -142,6 +220,16 @@ class SecurityEngine:
         return actions, self.provider.evaluate(fresh)
 
     # -- incidents -------------------------------------------------------------------------
+    def rollback(self, report: dict, dry_run: bool = False) -> list[RemediationAction]:
+        """Undo the applied actions recorded in an incident report (newest first)."""
+        res = report.get("resource") or {}
+        applied = [a for a in report.get("remediation") or [] if a.get("status") == "applied"]
+        if not applied:
+            raise ProviderError("This report has no applied remediation to roll back.")
+        if report.get("rollback", {}).get("status") == "applied":
+            raise ProviderError("This remediation was already rolled back.")
+        return self.provider.rollback(self.provider.get_resource(res["name"]), list(reversed(applied)), dry_run)
+
     def new_incident(self, result: ScanResult, investigation: Investigation | None = None) -> Incident:
         now = datetime.now(timezone.utc)
         res = result.posture.resource
@@ -236,3 +324,32 @@ def alert_data_accessed(settings: Settings, provider_name: str, name: str, inv: 
     except AlertError as exc:
         return str(exc)
     return None
+
+
+@dataclass
+class AccountScan:
+    account: dict                 # {"id", "name"}
+    engine: SecurityEngine
+    results: list[ScanResult]
+    review: object | None         # account.AccountReview
+
+
+def scan_all_accounts(provider: StorageProvider, settings: Settings,
+                      on_progress: Callable[[str], None] | None = None) -> tuple[list[AccountScan], dict[str, str]]:
+    """Scan every account the login can reach (AWS Organizations / Azure subscriptions / GCP projects).
+
+    Returns (scans, errors per account ID). Accounts that can't be accessed are reported, not fatal.
+    """
+    scans: list[AccountScan] = []
+    errors: dict[str, str] = {}
+    accounts = provider.list_accounts()
+    for i, acct in enumerate(accounts, 1):
+        if on_progress:
+            on_progress(f"Account {i}/{len(accounts)}: {acct['name']} ({acct['id']})")
+        try:
+            engine = SecurityEngine(provider.for_account(acct["id"]), settings)
+            results = engine.scan(on_progress=lambda n, a=acct["id"]: on_progress and on_progress(f"  {a}: {n}"))
+            scans.append(AccountScan(acct, engine, results, engine.review_account()))
+        except ProviderError as exc:
+            errors[acct["id"]] = str(exc)
+    return scans, errors

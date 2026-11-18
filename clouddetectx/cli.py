@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.console import Console
@@ -32,7 +34,6 @@ from clouddetectx.config import Settings
 from clouddetectx.engine import ScanResult, SecurityEngine, after_scan, alert_data_accessed
 from clouddetectx.models import Finding, Incident, Investigation, RemediationAction, Severity
 from clouddetectx.providers import PROVIDERS, ProviderError, get_provider
-from clouddetectx.providers.base import StorageProvider
 from clouddetectx.overview import grade
 from clouddetectx.reporting import write_report
 
@@ -68,10 +69,10 @@ def print_scan_table(provider_name: str, account: str, results: list[ScanResult]
     table.add_column("Risk", justify="right")
     table.add_column("Highest")
     table.add_column("Findings", justify="right")
-    order = {"public": 0, "mitigated": 1, "private": 2}
+    order = {"public": 0, "accepted": 1, "mitigated": 2, "private": 3}
     for r in sorted(results, key=lambda r: (order[r.status], -(risks[r.posture.resource.name].score
                                                                 if r.posture.resource.name in risks else 0))):
-        exposure = {"public": "[bold white on red] PUBLIC [/]", "mitigated": "[yellow]mitigated[/]",
+        exposure = {"public": "[bold white on red] PUBLIC [/]", "accepted": "[cyan]accepted[/]", "mitigated": "[yellow]mitigated[/]",
                     "private": "[green]private[/]"}[r.status]
         top = r.top_severity
         table.add_row(r.posture.resource.name, r.posture.resource.location or "-", exposure,
@@ -202,41 +203,67 @@ def print_actions(actions: list[RemediationAction], title: str) -> None:
 
 # --------------------------------------------------------------------------- workflow pieces
 
-def _identity(provider, quiet: bool = False):
-    """Run the provider's IAM analysis. Returns (report or None, error or None)."""
-    if type(provider).analyze_identity is StorageProvider.analyze_identity:
-        return None, None
-    try:
-        if quiet:
-            return provider.analyze_identity(), None
-        with console.status("Analysing IAM permissions..."):
-            return provider.analyze_identity(), None
-    except ProviderError as exc:
-        return None, str(exc)
+def review_account(engine: SecurityEngine, quiet: bool = False):
+    """Account-wide review (IAM + account checks) or None when switched off."""
+    if quiet:
+        return engine.review_account()
+    with console.status("Checking IAM and account-wide settings...") as status:
+        return engine.review_account(on_progress=status.update)
 
 
-def print_iam_summary(report, error: str | None, show_all: bool = False) -> None:
-    if error:
-        console.print(f"[yellow]IAM analysis skipped:[/] {error}")
+def print_account_summary(review, show_all: bool = False) -> None:
+    if review is None:
         return
-    if report is None:
-        return
-    c = report.counts()
-    console.print(f"\n[bold]IAM permissions[/]: {c['principals']} principal(s) analysed "
-                  f"({c['users']} users, {c['roles']} roles), [bold]{c['risky']}[/] flagged")
-    flagged = [p for p in report.principals if p.risky or show_all]
-    if flagged:
-        table = Table(expand=True)
-        for col in ("Principal", "Type", "Storage permissions", "Console MFA", "Keys > 90 days"):
-            table.add_column(col)
-        from clouddetectx.iam import CAPABILITY_LABELS, _risk_order
-        for p in sorted(flagged, key=_risk_order)[:40]:
-            caps = ", ".join(CAPABILITY_LABELS[k] + (" (conditional)" if v == "conditional" else "")
-                             for k, v in p.capabilities.items()) or "[dim]scoped[/]"
-            mfa = "-" if not p.console else ("yes" if p.mfa else "[bold red]no[/]")
-            table.add_row(p.name, p.kind, caps, mfa, str(len(p.old_keys)) if p.old_keys else "-")
-        console.print(table)
-    print_findings(report.findings, 0 if show_all else 2)
+    iam = review.iam
+    console.print(f"\n[bold]Account-wide checks[/] ({review.account_id}): "
+                  f"{len(review.findings)} finding(s)" + (f", {len(review.waived)} accepted" if review.waived else ""))
+    if iam is not None:
+        c = iam.counts()
+        console.print(f"IAM: {c['principals']} principal(s) analysed ({c['users']} users, {c['roles']} roles), "
+                      f"[bold]{c['risky']}[/] flagged")
+        flagged = [p for p in iam.principals if p.risky or show_all]
+        if flagged:
+            table = Table(expand=True)
+            for col in ("Principal", "Type", "Storage permissions", "Console MFA", "Keys > 90 days"):
+                table.add_column(col)
+            from clouddetectx.iam import CAPABILITY_LABELS, _risk_order
+            for p in sorted(flagged, key=_risk_order)[:40]:
+                caps = ", ".join(CAPABILITY_LABELS[k] + (" (conditional)" if v == "conditional" else "")
+                                 for k, v in p.capabilities.items()) or "[dim]scoped[/]"
+                mfa = "-" if not p.console else ("yes" if p.mfa else "[bold red]no[/]")
+                table.add_row(p.name, p.kind, caps, mfa, str(len(p.old_keys)) if p.old_keys else "-")
+            console.print(table)
+    print_findings(review.findings, 0 if show_all else 2)
+    for area, err in sorted(review.errors.items()):
+        console.print(f"[yellow]Skipped {area}:[/] {err[:160]}")
+
+
+def _scan_provider(name: str, settings: Settings, args, status=None):
+    """Scan one cloud (one account or all accounts). Returns (label, results, reviews, scope, accounts, errors)."""
+    from clouddetectx.engine import scan_all_accounts
+
+    provider = get_provider(name, settings)
+    engine = SecurityEngine(provider, settings)
+    names = getattr(args, "names", None) or None
+    skip_account = getattr(args, "no_account_checks", False)
+    if skip_account:
+        settings.account_checks = False
+    if getattr(args, "all_accounts", False):
+        if names:
+            raise ProviderError("--all-accounts can't be combined with resource names.")
+        with console.status(f"Scanning every {PROVIDERS[name]} account...") as st:
+            scans, errors = scan_all_accounts(provider, settings, on_progress=st.update)
+        for acct, err in errors.items():
+            console.print(f"[yellow]Skipped account {acct}:[/] {err}")
+        results = [r for sc in scans for r in sc.results]
+        reviews = {sc.account["id"]: sc.review for sc in scans}
+        return (f"All {PROVIDERS[name]} accounts ({len(scans)})", results, reviews, "all",
+                [sc.account for sc in scans], errors)
+    account = provider.account_label()
+    with console.status(f"Scanning {PROVIDERS[name]}...") as st:
+        results = engine.scan(names, on_progress=lambda n: st.update(f"Scanning {name}: {n}"))
+    review = None if names else review_account(engine)
+    return account, results, {provider.account_id(): review}, "account", [], {}
 
 
 def _providers(arg: str | None) -> list[str]:
@@ -317,16 +344,15 @@ def cmd_whoami(args, settings: Settings) -> int:
 
 
 def cmd_scan(args, settings: Settings) -> int:
+    from clouddetectx import state
+    from clouddetectx.account import merge_reviews
+
     any_exposed = False
     export = []
     for name in _providers(args.provider):
-        provider = get_provider(name, settings)
-        account = provider.account_label()
-        engine = SecurityEngine(provider, settings)
-        with console.status(f"Scanning {PROVIDERS[name]}...") as status:
-            results = engine.scan(args.names or None, on_progress=lambda n: status.update(f"Scanning {name}: {n}"))
+        account, results, reviews, scope, accounts, errors = _scan_provider(name, settings, args)
         outcome = after_scan(settings, name, account, results, full_scan=not args.names)
-        iam_report, iam_error = (None, None) if args.no_iam else _identity(provider)
+        review = merge_reviews(list(reviews.values()))
         print_scan_table(name, account, results, outcome.risks)
         print_outcome(outcome)
         if outcome.posture_score is not None:
@@ -335,14 +361,19 @@ def cmd_scan(args, settings: Settings) -> int:
             if r.exposed or args.all:
                 console.print(f"\n[bold]{r.posture.resource.name}[/]")
                 print_findings(r.findings, 0 if args.all else 2)
-            export.append({"provider": name, "resource": r.posture.resource.name, "status": r.status,
-                           "risk": outcome.risks[r.posture.resource.name].to_dict(),
+            if r.accepted and args.all:
+                console.print(f"  [dim]{len(r.accepted)} finding(s) accepted by waiver[/]")
+            export.append({"provider": name, "account": r.posture.resource.account, "resource": r.posture.resource.name,
+                           "status": r.status, "risk": outcome.risks[r.posture.resource.name].to_dict(),
                            "encryption": r.posture.config.get("encryption_summary"),
-                           "findings": [f.to_dict() for f in r.findings]})
-        print_iam_summary(iam_report, iam_error, args.all)
-        if iam_report is not None:
-            export.append({"provider": name, "iam": iam_report.to_dict()})
-        any_exposed |= any(r.exposed for r in results)
+                           "findings": [f.to_dict() for f in r.findings],
+                           "accepted": [f.to_dict() for f in r.accepted]})
+        print_account_summary(review, args.all)
+        if review is not None:
+            export.append({"provider": name, "account_review": review.to_dict()})
+        if not args.names:
+            state.save_scan(settings, name, account, results, reviews, outcome, scope, accounts, errors)
+        any_exposed |= any(r.exposed for r in results) or any(f.exposes_data for f in (review.findings if review else []))
     if args.json:
         Path(args.json).write_text(json.dumps(export, indent=2, default=str), encoding="utf-8")
         console.print(f"\nResults written to {args.json}")
@@ -450,21 +481,18 @@ def cmd_compliance(args, settings: Settings) -> int:
 
     rows_all = []
     for name in _providers(args.provider):
-        provider = get_provider(name, settings)
-        engine = SecurityEngine(provider, settings)
-        with console.status(f"Scanning {PROVIDERS[name]}...") as status:
-            results = engine.scan(args.names or None, on_progress=lambda n: status.update(f"Scanning {name}: {n}"))
-        iam_report, iam_error = (None, None) if args.no_iam or args.names else _identity(provider)
-        if iam_error:
-            console.print(f"[yellow]IAM analysis skipped:[/] {iam_error}")
-        data = compliance_data(name, results, iam_report)
+        from clouddetectx.account import merge_reviews
+
+        account_label, results, reviews, *_ = _scan_provider(name, settings, args)
+        review = merge_reviews(list(reviews.values()))
+        data = compliance_data(name, results, review)
         rows = data["controls"]
         if args.framework:
             rows = [r for r in rows if r["framework"] == args.framework.upper()]
         rows_all += [{**r, "provider": name} for r in rows]
 
         summary = Table(title=f"Compliance | {PROVIDERS[name]} | {len(results)} resource(s)"
-                              + (" + IAM" if iam_report is not None else ""), title_justify="left", expand=True)
+                              + (" + account-wide checks" if review is not None else ""), title_justify="left", expand=True)
         for col, just in (("Framework", "left"), ("Controls", "right"), ("Fully passing", "right"),
                           ("Failing", "right"), ("Resource-level pass rate", "right")):
             summary.add_column(col, justify=just)
@@ -489,34 +517,166 @@ def cmd_compliance(args, settings: Settings) -> int:
         console.print(table)
         if args.report:
             risks = {r.posture.resource.name: score_resource(r.findings) for r in results}
-            report = build_compliance_report(name, PROVIDERS[name], provider.account_label(), results, risks,
-                                             iam_report, posture_score(list(risks.values())))
+            report = build_compliance_report(name, PROVIDERS[name], account_label, results, risks,
+                                             review, posture_score(list(risks.values())))
             md_path, json_path = write_compliance_report(report, settings.reports_dir)
             console.print(f"[green]Compliance report:[/] {md_path}\n[dim]Evidence: {json_path}[/]")
+            if args.pdf:
+                from clouddetectx.export import markdown_to_pdf
+
+                pdf_path = md_path.with_suffix(".pdf")
+                pdf_path.write_bytes(markdown_to_pdf(md_path.read_text(encoding="utf-8"), md_path.stem))
+                console.print(f"[green]PDF:[/] {pdf_path}")
     if args.json:
         Path(args.json).write_text(json.dumps(rows_all, indent=2), encoding="utf-8")
         console.print(f"Written to {args.json}")
     return EXIT_EXPOSED if rows_all else EXIT_OK
 
 
-def cmd_iam(args, settings: Settings) -> int:
+def cmd_account(args, settings: Settings) -> int:
     flagged_any = False
+    settings.account_checks = True
     for name in _providers(args.provider):
-        provider = get_provider(name, settings)
-        console.print(f"[bold]{PROVIDERS[name]}[/] | {provider.account_label()}")
-        report, error = _identity(provider)
-        if report is None and not error:
-            console.print("[dim]IAM analysis is available for AWS. Azure RBAC and GCP IAM are not analysed yet.[/]")
-            continue
-        print_iam_summary(report, error, args.all)
-        if report is not None:
-            for note in report.notes:
-                console.print(f"[dim]{note}[/]")
-            flagged_any |= any(f.severity.rank >= 2 for f in report.findings)
-            if args.json:
-                Path(args.json).write_text(json.dumps(report.to_dict(), indent=2, default=str), encoding="utf-8")
-                console.print(f"Written to {args.json}")
+        engine = SecurityEngine(get_provider(name, settings), settings)
+        console.print(f"[bold]{PROVIDERS[name]}[/] | {engine.provider.account_label()}")
+        review = review_account(engine)
+        print_account_summary(review, args.all)
+        for note in review.notes:
+            console.print(f"[dim]{note}[/]")
+        flagged_any |= any(f.severity.rank >= 2 for f in review.findings)
+        if args.json:
+            Path(args.json).write_text(json.dumps(review.to_dict(), indent=2, default=str), encoding="utf-8")
+            console.print(f"Written to {args.json}")
     return EXIT_EXPOSED if flagged_any else EXIT_OK
+
+
+def cmd_waivers(args, settings: Settings) -> int:
+    from clouddetectx.waivers import WaiverError, WaiverStore
+
+    store = WaiverStore(settings.data_dir)
+    if args.action == "add":
+        if not (args.resource and args.check and args.reason and args.expires):
+            console.print("[red]add needs RESOURCE, --check, --reason and --expires.[/] Example:\n"
+                          "  python main.py -p aws waivers add my-website-bucket --check '*' "
+                          "--reason 'public website assets' --expires 2027-06-30\n"
+                          "Account-wide findings use the resource 'account:<account id>'.")
+            return EXIT_ERROR
+        try:
+            w = store.add(_single_provider(args.provider), args.resource, args.check, args.reason, args.expires,
+                          os.getenv("USERNAME") or os.getenv("USER") or "")
+        except WaiverError as exc:
+            console.print(f"[red]{exc}[/]")
+            return EXIT_ERROR
+        console.print(f"[green]Waiver {w.id} added[/]: {w.provider} {w.resource} {w.check_id} until {w.expires}")
+        return EXIT_OK
+    if args.action == "remove":
+        if not args.resource:
+            console.print("[red]remove needs the waiver ID (see `waivers list`).[/]")
+            return EXIT_ERROR
+        ok = store.remove(args.resource)
+        console.print("[green]Removed.[/]" if ok else "[yellow]No waiver with that ID.[/]")
+        return EXIT_OK if ok else EXIT_ERROR
+    table = Table(title="Accepted-risk waivers", title_justify="left", expand=True)
+    for col in ("ID", "Cloud", "Resource", "Check", "Expires", "Reason"):
+        table.add_column(col)
+    for w in sorted(store.all(), key=lambda w: w.expires):
+        table.add_row(w.id, w.provider, w.resource, w.check_id,
+                      f"[red]{w.expires} (expired)[/]" if w.expired else w.expires, w.reason)
+    if not store.all():
+        table.add_row("-", "-", "No waivers", "-", "-", "-")
+    console.print(table)
+    return EXIT_OK
+
+
+def cmd_rollback(args, settings: Settings) -> int:
+    from clouddetectx.reporting import record_rollback
+
+    if not re.fullmatch(r"INC-[A-Za-z0-9._-]+", args.report):
+        console.print("[red]Give an incident report ID, e.g. INC-20261117-033902-aws-my-bucket.[/]")
+        return EXIT_ERROR
+    json_path = settings.reports_dir / f"{args.report}.json"
+    md_path = settings.reports_dir / f"{args.report}.md"
+    if not json_path.is_file():
+        console.print(f"[red]Report not found in {settings.reports_dir}.[/]")
+        return EXIT_ERROR
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+    res = report.get("resource") or {}
+    provider = get_provider(res.get("provider", ""), settings)
+    if res.get("account") and res["account"] != provider.account_id():
+        provider = provider.for_account(res["account"])
+    engine = SecurityEngine(provider, settings)
+    plan = engine.rollback(report, dry_run=True)
+    print_actions(plan, f"Rollback plan for {res.get('name')}")
+    if args.dry_run:
+        return EXIT_OK
+    console.print("[bold yellow]Rolling back restores the configuration from before remediation. "
+                  "If the resource was public, it becomes public again.[/]")
+    if not args.yes and not Confirm.ask(f"Roll back {res.get('name')}?", default=False):
+        console.print("Cancelled.")
+        return EXIT_OK
+    actions = engine.rollback(report, dry_run=False)
+    print_actions(actions, "Rollback result")
+    entry = record_rollback(json_path, md_path, actions)
+    console.print(f"Recorded in {md_path} (status: {entry['status']})")
+    return EXIT_OK if entry["status"] == "applied" else EXIT_ERROR
+
+
+def cmd_export(args, settings: Settings) -> int:
+    from clouddetectx import export as exporter
+    from clouddetectx.account import merge_reviews
+
+    out = Path(args.output) if args.output else None
+    formats = list(exporter.FORMATS) if args.format == "all" else [args.format]
+    exit_code = EXIT_OK
+    for name in _providers(args.provider):
+        label, results, reviews, *_ = _scan_provider(name, settings, args)
+        review = merge_reviews(list(reviews.values()))
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        for fmt in formats:
+            if fmt == "csv":
+                text, ext = exporter.to_csv(name, results, review), "csv"
+            elif fmt == "sarif":
+                text, ext = json.dumps(exporter.to_sarif(name, results, review), indent=2), "sarif"
+            else:
+                text, ext = json.dumps(exporter.to_ocsf(name, results, review), indent=2), "ocsf.json"
+            if out and len(formats) == 1 and len(_providers(args.provider)) == 1 and out.suffix:
+                path = out
+            else:
+                folder = out or settings.reports_dir
+                folder.mkdir(parents=True, exist_ok=True)
+                path = folder / f"clouddetectx-{name}-{stamp}.{ext}"
+            path.write_text(text, encoding="utf-8")
+            console.print(f"[green]{fmt.upper()}:[/] {path}")
+        if any(r.exposed for r in results):
+            exit_code = EXIT_EXPOSED
+    return exit_code
+
+
+def cmd_schedule(args, settings: Settings) -> int:
+    from clouddetectx import schedule
+
+    if args.action == "status":
+        st = schedule.status()
+        console.print(("[green]Installed[/]: " if st["installed"] else "[dim]") + st["detail"] + ("" if st["installed"] else "[/]"))
+        return EXIT_OK
+    if args.action == "remove":
+        console.print(schedule.remove())
+        return EXIT_OK
+    try:
+        plan = schedule.plan(settings.data_dir, args.every, _providers(args.provider), args.all_accounts)
+    except schedule.ScheduleError as exc:
+        console.print(f"[red]{exc}[/]")
+        return EXIT_ERROR
+    if args.print:
+        console.print(f"[bold]Script[/] {plan.script}:\n{plan.script_body}")
+        console.print(f"[bold]Install[/]: {plan.crontab or ' '.join(plan.install[0])}")
+        return EXIT_OK
+    try:
+        console.print(f"[green]{schedule.install(plan)}[/]\nOutput is appended to {settings.data_dir / 'logs' / 'scheduled-scan.log'}.")
+    except schedule.ScheduleError as exc:
+        console.print(f"[red]{exc}[/]")
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 def cmd_history(args, settings: Settings) -> int:
@@ -608,7 +768,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("names", nargs="*", help="only these buckets/storage accounts")
     p.add_argument("--all", action="store_true", help="show every finding for every resource")
     p.add_argument("--json", help="also write results to this JSON file")
-    p.add_argument("--no-iam", action="store_true", help="skip the IAM permission analysis (AWS)")
+    p.add_argument("--all-accounts", action="store_true",
+                   help="every AWS Organizations account / Azure subscription / GCP project you can reach")
+    p.add_argument("--no-account-checks", "--no-iam", dest="no_account_checks", action="store_true",
+                   help="skip IAM and account-wide checks")
     p.set_defaults(func=cmd_scan)
 
     p = sub.add_parser("discover", parents=[common], help="find secrets and personal data inside a resource (read-only)")
@@ -648,13 +811,45 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--framework", choices=["NIST", "CIS8", "ISO", "CISB", "nist", "cis8", "iso", "cisb"])
     p.add_argument("--json", help="also write the result to this JSON file")
     p.add_argument("--report", action="store_true", help="write a compliance report (Markdown + JSON) to the reports folder")
-    p.add_argument("--no-iam", action="store_true", help="skip the IAM permission analysis (AWS)")
+    p.add_argument("--pdf", action="store_true", help="with --report, also write a PDF")
+    p.add_argument("--all-accounts", action="store_true", help="every account / subscription / project you can reach")
+    p.add_argument("--no-account-checks", "--no-iam", dest="no_account_checks", action="store_true",
+                   help="skip IAM and account-wide checks")
     p.set_defaults(func=cmd_compliance)
 
-    p = sub.add_parser("iam", parents=[common], help="who can access storage: IAM permission analysis (AWS, read-only)")
+    p = sub.add_parser("account", aliases=["iam"], parents=[common],
+                       help="IAM permissions and account-wide checks (logging, root/MFA, network, databases, keys)")
     p.add_argument("--all", action="store_true", help="list every principal and finding, not only flagged ones")
-    p.add_argument("--json", help="also write the analysis to this JSON file")
-    p.set_defaults(func=cmd_iam)
+    p.add_argument("--json", help="also write the review to this JSON file")
+    p.set_defaults(func=cmd_account)
+
+    p = sub.add_parser("waivers", parents=[common], help="accept a risk (e.g. a bucket that is public on purpose)")
+    p.add_argument("action", nargs="?", choices=["list", "add", "remove"], default="list")
+    p.add_argument("resource", nargs="?", help="resource name (add) or waiver ID (remove)")
+    p.add_argument("--check", help="check ID, e.g. AWS-S3-003, or '*' for every check on the resource")
+    p.add_argument("--reason", help="why this is acceptable")
+    p.add_argument("--expires", help="date the waiver ends, e.g. 2027-06-30 (max two years)")
+    p.set_defaults(func=cmd_waivers)
+
+    p = sub.add_parser("rollback", parents=[common], help="undo a remediation using the configuration saved in its report")
+    p.add_argument("report", help="incident report ID (INC-...)")
+    p.add_argument("--dry-run", action="store_true", help="show what would be restored")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_rollback)
+
+    p = sub.add_parser("export", parents=[common], help="scan and export findings as SARIF, OCSF or CSV")
+    p.add_argument("--format", choices=["sarif", "ocsf", "csv", "all"], default="sarif")
+    p.add_argument("-o", "--output", help="output file (single format) or folder (default: reports folder)")
+    p.add_argument("--all-accounts", action="store_true", help="every account / subscription / project you can reach")
+    p.add_argument("--no-account-checks", dest="no_account_checks", action="store_true", help="skip account-wide checks")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("schedule", parents=[common], help="run scans automatically (Task Scheduler / cron)")
+    p.add_argument("action", nargs="?", choices=["install", "remove", "status"], default="status")
+    p.add_argument("--every", type=int, default=1440, help="minutes between scans (default 1440 = daily, min 15)")
+    p.add_argument("--all-accounts", action="store_true", help="scan every account each time")
+    p.add_argument("--print", action="store_true", help="show the task instead of installing it")
+    p.set_defaults(func=cmd_schedule)
 
     p = sub.add_parser("history", parents=[common], help="scan history and security-score trend")
     p.add_argument("--limit", type=int, default=20)
@@ -680,7 +875,7 @@ def build_parser() -> argparse.ArgumentParser:
                                    "config set KEY [VALUE]   change one (prompted if VALUE is omitted)\n"
                                    "config unset KEY  reset one to its default",
                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("action", nargs="?", choices=["show", "set", "unset", "wizard"])
+    p.add_argument("action", nargs="?", choices=["show", "set", "unset", "wizard", "migrate-secrets"])
     p.add_argument("key", nargs="?", help="setting name, e.g. AWS_PROFILE, aws_region, CLOUDDETECTX_LOOKBACK_DAYS")
     p.add_argument("value", nargs="?", help="new value; omit it to be prompted (recommended for secrets)")
     p.set_defaults(func=cmd_config)
@@ -710,8 +905,20 @@ def cmd_config(args, settings: Settings) -> int:
         for col in ("Section", "Setting", "Value", "Variable"):
             table.add_column(col)
         for f in FIELDS:
-            table.add_row(f.section, f.label, display(f, settings.get(f)), f.key)
+            where = settings.secret_locations.get(f.key)
+            value = display(f, settings.get(f)) + (f" [dim]in {'OS keychain' if where == 'keychain' else '.env'}[/]" if where else "")
+            table.add_row(f.section, f.label, value, f.key)
         console.print(table)
+        return EXIT_OK
+
+    if args.action == "migrate-secrets":
+        from clouddetectx.config import secret_store
+
+        if not secret_store.available:
+            console.print("[yellow]No OS keychain is available here; secrets stay in .env.[/]")
+            return EXIT_ERROR
+        moved = settings.migrate_secrets()
+        console.print(f"[green]Moved to the OS keychain:[/] {', '.join(moved)}" if moved else "Nothing to move: no secrets in .env.")
         return EXIT_OK
 
     if not args.key:
@@ -727,7 +934,8 @@ def cmd_config(args, settings: Settings) -> int:
             console.print(f"[dim]{f.help}[/]")
             raw = getpass.getpass(f"{f.label} (hidden): ") if f.secret else input(f"{f.label}: ")
     value = settings.set(f, raw)
-    console.print(f"[green]Saved[/] {f.label} = [bold]{display(f, value)}[/]  [dim]({f.key} in {ENV_FILE})[/]")
+    where = "the OS keychain" if settings.secret_locations.get(f.key) == "keychain" else str(ENV_FILE)
+    console.print(f"[green]Saved[/] {f.label} = [bold]{display(f, value)}[/]  [dim]({f.key} in {where})[/]")
     return EXIT_OK
 
 

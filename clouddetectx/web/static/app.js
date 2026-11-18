@@ -14,6 +14,7 @@ const SEV_LABEL = { CRITICAL: "Critical", HIGH: "High", MEDIUM: "Medium", LOW: "
 const DARK_INK = new Set(["HIGH", "MEDIUM", "INFO", "mitigated"]);
 const STATUS = {
   public: { label: "Public", cls: "crit" },
+  accepted: { label: "Accepted", cls: "neutral" },
   mitigated: { label: "Mitigated", cls: "warn" },
   private: { label: "Private", cls: "good" },
 };
@@ -30,7 +31,7 @@ const CLASSIFICATION = {
   NONE_FOUND: { label: "Nothing sensitive", cls: "good", text: "Nothing sensitive was detected in the sampled objects." },
 };
 const INCIDENT_STATUS = {
-  CONTAINED: "good", NO_EXPOSURE: "good", OPEN: "crit", REMEDIATION_FAILED: "crit", REMEDIATION_PLANNED: "warn",
+  CONTAINED: "good", NO_EXPOSURE: "good", OPEN: "crit", REMEDIATION_FAILED: "crit", REMEDIATION_PLANNED: "warn", ROLLED_BACK: "warn",
 };
 const FW_SHORT = { NIST: "NIST", CIS8: "CIS v8", ISO: "ISO", CISB: "CIS" };
 
@@ -166,7 +167,12 @@ async function route() {
   tip.hidden = true;
   try {
     if (!state.status) await refreshStatus();
-    if (page === "dashboard") await renderDashboard();
+    if (!state.status.configured && page !== "setup" && page !== "settings" && !recall("clouddetectx.setup-skipped")) {
+      location.hash = "#/setup";
+      return;
+    }
+    if (page === "setup") await renderSetup(parts[1] || "clouds");
+    else if (page === "dashboard") await renderDashboard();
     else if (page === "r") await renderResource(parts[1], parts[2], parts[3] || "findings");
     else if (page === "respond") await renderRespond();
     else if (page === "iam") await renderIam();
@@ -217,7 +223,8 @@ actions.scan = async (el) => {
   const box = $("#scan-progress");
   await withBusy(el, "Scanning", async () => {
     try {
-      const { job } = await api(`/api/clouds/${state.cloud}/scan`, { method: "POST" });
+      const scope = $("#scope");
+      const { job } = await api(`/api/clouds/${state.cloud}/scan`, { method: "POST", body: { all_accounts: scope ? scope.value === "all" : false } });
       await runJob(job, (j) => { if (box) { box.hidden = false; box.textContent = j.progress.slice(-1)[0]?.msg || "Starting..."; } });
       toast("Scan complete", "ok");
     } catch (e) { toast(e.message, "err"); }
@@ -245,7 +252,7 @@ function segBar(parts, { thin = false, unit = "" } = {}) {
     <details class="table-view"><summary>Show as table</summary><table><thead><tr><th>Category</th><th class="num">Count</th><th class="num">Share</th></tr></thead><tbody>${rows}</tbody></table></details>`;
 }
 const severityParts = (counts) => SEV.map((s) => ({ key: s, label: SEV_LABEL[s], value: counts[s] || 0, cls: `sev-${s}` }));
-const exposureParts = (c) => ["public", "mitigated", "private"].map((st) => ({ key: st, label: STATUS[st].label, value: c[st] || 0, cls: `st-${st}` }));
+const exposureParts = (c) => ["public", "accepted", "mitigated", "private"].map((st) => ({ key: st, label: STATUS[st].label, value: c[st] || 0, cls: `st-${st}` }));
 
 /* Single-series line chart (inline SVG) with crosshair + tooltip and a table view. */
 function lineChart(points, { label, max = null, cls = "", fmt = (v) => nf.format(v), wide = false } = {}) {
@@ -315,6 +322,7 @@ function driftBanner(c) {
   const lines = [];
   if (d.new_public.length) lines.push(`${badge("Newly public", "crit")} ${list(d.new_public)}`);
   if (d.resolved.length) lines.push(`${badge("Fixed", "good")} ${list(d.resolved)}`);
+  if ((d.accepted || []).length) lines.push(`${badge("Accepted", "neutral")} ${list(d.accepted)}`);
   if (d.new_resources.length) lines.push(`${badge("New", "neutral")} ${list(d.new_resources)}`);
   if (d.removed_resources.length) lines.push(`${badge("Removed", "neutral")} ${list(d.removed_resources)}`);
   if (d.risk_increased.length) lines.push(`${badge("Risk up", "warn")} ${d.risk_increased.slice(0, 6).map((x) => `<b>${esc(x.name)}</b> ${x.from}→${x.to}`).join(", ")}`);
@@ -342,9 +350,17 @@ async function renderDashboard() {
     <div class="actions">
       ${c.connected ? "" : `<button class="btn" data-action="connect">Connect</button>`}
       ${c.error || c.hint ? `<a class="btn" href="#/settings">Fix in Settings</a>` : ""}
+      ${c.scanned_at ? exportMenu(c.name) : ""}
+      <select id="scope" aria-label="Scan scope" data-tip="All accounts = AWS Organizations accounts, Azure subscriptions or GCP projects you can reach">
+        <option value="account" ${c.scope !== "all" ? "selected" : ""}>This account</option>
+        <option value="all" ${c.scope === "all" ? "selected" : ""}>All accounts</option></select>
       <button class="btn primary" data-action="scan">${c.scanned_at ? "Scan again" : "Scan now"}</button>
     </div></div>
-    <div id="scan-progress" class="log" hidden></div>`;
+    <div id="scan-progress" class="log" hidden></div>
+    ${c.restored ? `<div class="banner info" style="margin-bottom:12px"><div class="icon">↺</div><div><strong>Showing the last saved scan (${esc(timeAgo(c.scanned_at))})</strong>
+      Results were kept from before the dashboard restarted. Scan again for current data.</div></div>` : ""}
+    ${c.scope === "all" && Object.keys(c.account_errors || {}).length ? `<div class="banner warn" style="margin-bottom:12px"><div class="icon">!</div><div>
+      <strong>${Object.keys(c.account_errors).length} account(s) could not be scanned</strong>${Object.entries(c.account_errors).slice(0, 4).map(([a, e]) => `${esc(a)}: ${esc(e)}`).join("<br>")}</div></div>` : ""}`;
 
   if (!c.scanned_at) {
     main.innerHTML = `${head}<div class="card empty"><h2>No scan yet for ${esc(c.display)}</h2>
@@ -400,13 +416,13 @@ async function renderDashboard() {
       <div class="toolbar">
         <input type="search" id="q" placeholder="Filter by name or region" value="${esc(state.query)}" aria-label="Filter resources">
         <div class="seg-ctrl" role="group" aria-label="Status filter">
-          ${["all", "public", "mitigated", "private"].map((f) => `<button data-action="filter" data-filter="${f}" class="${state.filter === f ? "on" : ""}">
+          ${["all", "public", "accepted", "mitigated", "private"].filter((f) => f !== "accepted" || counts.accepted).map((f) => `<button data-action="filter" data-filter="${f}" class="${state.filter === f ? "on" : ""}">
             ${f === "all" ? `All (${counts.resources})` : `${STATUS[f].label} (${counts[f]})`}</button>`).join("")}
         </div>
         ${catFilter ? `<span class="chip on">Failing: ${esc(catFilter.label)} <button class="x" data-action="cat-clear" aria-label="Clear category filter">×</button></span>` : ""}
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Status</th><th>Name</th><th>Location</th><th>Risk</th><th>Highest severity</th><th>Encryption</th><th>Data</th><th>Access verdict</th></tr></thead>
+        <thead><tr><th>Status</th><th>Name</th>${c.scope === "all" ? "<th>Account</th>" : ""}<th>Location</th><th>Risk</th><th>Highest severity</th><th>Encryption</th><th>Data</th><th>Access verdict</th></tr></thead>
         <tbody id="rows"></tbody></table></div>
     </section>
     ${overviewCard()}`;
@@ -445,22 +461,25 @@ function categoryTile(k, noun) {
       <div class="cat-v muted">${k.key === "data" ? "Run data discovery on a resource" : "Not assessed for this cloud"}</div></div></div>`;
   }
   const iam = k.principals != null;
+  const accountOnly = !iam && !k.resources_total;
   const total = k.resources_total, pass = total - k.resources_failing;
   const pct = total ? Math.round((100 * pass) / total) : null;
   const ok = !k.findings;
   const value = iam ? `${nf.format(k.risky_principals)}<span class="of">/${nf.format(k.principals)} principals flagged</span>`
+    : accountOnly ? `${nf.format(k.account_findings)}<span class="of"> account-wide issue${k.account_findings === 1 ? "" : "s"}</span>`
     : `${nf.format(pass)}<span class="of">/${nf.format(total)} ${esc(noun)} pass</span>`;
+  const acctLine = !iam && !accountOnly && k.account_findings ? `<div class="cat-a">+ ${k.account_findings} account-wide issue${k.account_findings === 1 ? "" : "s"}</div>` : "";
   const tipText = ok ? `${k.label}: no failing checks` : `${k.label}: ${k.findings} failing finding(s)${total ? `, ${k.resources_failing} of ${total} ${noun} affected` : ""}`;
-  return `<button class="cat ${ok ? "ok" : `bad sev-${k.worst}`} ${state.cat === k.key ? "sel" : ""}" data-action="${iam ? "go-iam" : "cat"}" data-cat="${k.key}" data-tip="${esc(tipText)}">
+  return `<button class="cat ${ok ? "ok" : `bad sev-${k.worst}`} ${state.cat === k.key ? "sel" : ""}" data-action="${iam || accountOnly ? "go-iam" : "cat"}" data-cat="${k.key}" data-tip="${esc(tipText)}">
     ${icon(k.key)}<div class="cat-b"><div class="cat-l">${esc(k.label)}</div>
-    <div class="cat-v">${value}</div>
+    <div class="cat-v">${value}</div>${acctLine}
     ${pct != null && !iam ? `<div class="meter"><i style="width:${Math.max(2, pct)}%"></i></div>` : ""}
     <div class="cat-s">${ok ? badge("All checks pass", "good") : sevTag(k.worst)}</div></div></button>`;
 }
 
 function priorityList(items) {
   if (!items.length) return `<div class="all-clear">${badge("All clear", "good")} Nothing urgent: no public exposure and no medium-or-higher findings.</div>`;
-  return `<ol class="prio">${items.map((p, i) => `<li data-action="${p.kind === "iam" ? "go-iam" : "open-resource"}" data-name="${esc(p.name)}" tabindex="0" class="sev-${p.severity}">
+  return `<ol class="prio">${items.map((p, i) => `<li data-action="${p.kind === "resource" ? "open-resource" : "go-iam"}" data-name="${esc(p.name)}" tabindex="0" class="sev-${p.severity}">
       <span class="prio-n">${i + 1}</span>
       <div class="prio-b"><div class="prio-t"><strong>${esc(p.name)}</strong> ${sevTag(p.severity)} ${p.exposed ? badge("Public", "crit") : ""}</div>
         <div class="prio-f">${esc(p.title)}</div><div class="prio-fix">${esc(p.recommendation)}</div></div>
@@ -528,7 +547,7 @@ actions["compliance-report"] = async (el) => {
 };
 
 function drawRows() {
-  const order = { public: 0, mitigated: 1, private: 2 };
+  const order = { public: 0, accepted: 1, mitigated: 2, private: 3 };
   const q = state.query.trim().toLowerCase();
   const rows = (state.rows || [])
     .filter((r) => state.filter === "all" || r.status === state.filter)
@@ -537,14 +556,15 @@ function drawRows() {
     .sort((a, b) => order[a.status] - order[b.status] || b.risk - a.risk || a.name.localeCompare(b.name));
   $("#rows").innerHTML = rows.length ? rows.map((r) => `<tr class="clickable" data-action="open-resource" data-name="${esc(r.name)}" tabindex="0">
       <td>${statusBadge(r.status)}${r.verified_public ? ` <span class="chip crit" data-tip="Confirmed by an anonymous request from the internet">verified</span>` : ""}</td>
-      <td><strong>${esc(r.name)}</strong></td>
+      <td><strong>${esc(r.name)}</strong>${r.accepted ? ` <span class="chip" data-tip="${r.accepted} finding(s) accepted by waiver">${r.accepted} accepted</span>` : ""}</td>
+      ${cloudInfo().scope === "all" ? `<td class="mono small">${esc(r.account || "-")}</td>` : ""}
       <td class="secondary">${esc(r.location || "-")}</td>
       <td>${riskCell(r.risk)}</td>
       <td>${sevTag(r.top_severity)}</td>
       <td>${encCell(r.encryption)}</td>
       <td>${classBadge(r.classification)}</td>
       <td>${verdictBadge(r.verdict)}</td></tr>`).join("")
-    : `<tr><td colspan="8" class="muted">No resources match.</td></tr>`;
+    : `<tr><td colspan="9" class="muted">No resources match.</td></tr>`;
 }
 
 actions.filter = (el) => {
@@ -623,14 +643,9 @@ function riskCard(risk) {
 
 function renderFindings(box, d) {
   const findings = d.findings;
-  box.innerHTML = riskCard(d.risk) + `<div style="margin-top:16px">${findings.length ? findings.map((f) => `<div class="finding ${f.exposes_data ? "exposing" : ""}">
-      <div class="top">${sevTag(f.severity)}<span class="muted mono">${esc(f.check_id)}</span>
-        <span class="title">${esc(f.title)}</span>${f.exposes_data ? badge("Public now", "crit") : ""}</div>
-      <p>${esc(f.description)}</p>
-      <div class="fix"><b>Fix:</b> ${esc(f.recommendation)}</div>
-      ${f.controls.length ? `<div class="chips">${f.controls.map(controlChip).join("")}</div>` : ""}
-      ${f.evidence && Object.keys(f.evidence).length ? `<details><summary class="muted">Evidence</summary><pre class="json">${esc(JSON.stringify(f.evidence, null, 2))}</pre></details>` : ""}
-    </div>`).join("") : `<div class="card empty"><h2>No findings</h2><p>This resource passed every check.</p></div>`}</div>`;
+  box.innerHTML = riskCard(d.risk) + `<div style="margin-top:16px">${findings.length ? findings.map((f) => findingCard(f, true)).join("")
+    : `<div class="card empty"><h2>No findings</h2><p>This resource passed every check${d.accepted.length ? " that isn't accepted" : ""}.</p></div>`}</div>
+    ${acceptedList(d.accepted)}`;
 }
 
 actions.rescan = async (el) => {
@@ -923,64 +938,17 @@ actions.respond = async (el) => {
 /* ------------------------------------------------------------------ identity & access (IAM) */
 const CAP_CLS = { admin: "crit", s3_full: "crit", can_expose: "warn", write_all: "warn", read_all: "" };
 
-function findingCard(f) {
-  return `<div class="finding">
-    <div class="top">${sevTag(f.severity)}<span class="muted mono">${esc(f.check_id)}</span><span class="title">${esc(f.title)}</span></div>
+function findingCard(f, evidence = false) {
+  const canWaive = f.waiver_resource && f.severity !== "INFO";
+  return `<div class="finding ${f.exposes_data ? "exposing" : ""}">
+    <div class="top">${sevTag(f.severity)}<span class="muted mono">${esc(f.check_id)}</span><span class="title">${esc(f.title)}</span>
+      ${f.exposes_data ? badge("Public now", "crit") : ""}${f.evidence && f.evidence.account ? `<span class="chip">${esc(f.evidence.account)}</span>` : ""}
+      ${canWaive ? `<button class="btn small link waive-btn" data-action="waive" data-resource="${esc(f.waiver_resource)}" data-check="${esc(f.check_id)}" data-title="${esc(f.title)}">Accept risk</button>` : ""}</div>
     <p>${esc(f.description)}</p>
     <div class="fix"><b>Fix:</b> ${esc(f.recommendation)}</div>
     ${f.controls && f.controls.length ? `<div class="chips">${f.controls.map(controlChip).join("")}</div>` : ""}
+    ${evidence && f.evidence && Object.keys(f.evidence).length ? `<details><summary class="muted">Evidence</summary><pre class="json">${esc(JSON.stringify(f.evidence, null, 2))}</pre></details>` : ""}
   </div>`;
-}
-
-async function renderIam() {
-  const c = cloudInfo();
-  const head = `<div class="page-head"><div><h1>Identity &amp; access</h1>
-      <div class="sub">${esc(c.display)} · who can read, change or expose your storage, based on IAM policies.</div></div>
-      <div class="actions">${c.name === "aws" ? `<button class="btn" data-action="iam-analyze">Re-analyse IAM</button>` : ""}</div></div>
-    <div id="iam-log" class="log" hidden></div>`;
-  if (c.name !== "aws") {
-    main.innerHTML = `${head}<div class="card empty"><h2>Available for AWS</h2>
-      <p>IAM permission analysis covers AWS IAM users, groups and roles. Azure RBAC and Google Cloud IAM analysis are on the roadmap.
-      Storage-level access checks (shared keys, uniform bucket-level access) still run in every scan.</p></div>`;
-    return;
-  }
-  const data = await api("/api/clouds/aws/iam");
-  if (!data.report) {
-    main.innerHTML = `${head}<div class="card empty"><h2>${data.error ? "IAM analysis failed" : "Not analysed yet"}</h2>
-      <p>${esc(data.error || "IAM permissions are analysed with every scan. It is read-only and needs iam:GetAccountAuthorizationDetails (included in the SecurityAudit policy).")}</p>
-      <button class="btn primary" data-action="scan">Scan now</button><div id="scan-progress" class="log" hidden></div></div>`;
-    return;
-  }
-  const r = data.report, k = r.counts;
-  const tile = (label, value, note, cls = "") => `<div class="kpi ${cls}"><div class="label">${esc(label)}</div>
-    <div class="value"><span data-count="${value}">${nf.format(value)}</span></div><div class="note">${note}</div></div>`;
-  const findings = r.findings.map((f) => ({ ...f, controls: data.controls[f.check_id] || [] }))
-    .sort((a, b) => SEV.indexOf(a.severity) - SEV.indexOf(b.severity));
-  main.innerHTML = `${head}
-    <section class="kpis iam">
-      ${tile("Principals analysed", k.principals, `${nf.format(k.users)} users · ${nf.format(k.roles)} roles${r.skipped_service_roles ? ` · ${r.skipped_service_roles} service-linked roles skipped` : ""}`)}
-      ${tile("Flagged", k.risky, k.risky ? badge("Review needed", "crit") : badge("Nothing flagged", "good"), k.risky ? "hero alert" : "hero")}
-      ${tile("Admin or full S3 access", k.admin + k.s3_full, `${nf.format(k.admin)} administrator(s) · ${nf.format(k.s3_full)} with s3:* on every bucket`)}
-      ${tile("Can make buckets public", k.can_expose, "change policies, ACLs or Block Public Access")}
-      ${tile("Console users without MFA", k.no_mfa, "password-only sign-in")}
-      ${tile("Access keys over 90 days", k.old_keys, "active and not rotated")}
-    </section>
-    <section style="margin-top:16px"><h2>Findings</h2>
-      ${findings.length ? findings.map(findingCard).join("") : `<div class="card empty"><h2>No IAM findings</h2><p>No principal has broad storage access, and every console user has MFA.</p></div>`}</section>
-    <section class="card" style="margin-top:16px"><div class="card-head"><h2>Principals</h2></div>
-      <div class="toolbar">
-        <input type="search" id="iam-q" placeholder="Filter by name" value="${esc(state.iamQuery)}" aria-label="Filter principals">
-        <div class="seg-ctrl" role="group" aria-label="Principal filter">
-          ${[["flagged", `Flagged (${k.risky})`], ["all", `All (${k.principals})`], ["user", "Users"], ["role", "Roles"]].map(([v, l]) =>
-            `<button data-action="iam-filter" data-v="${v}" class="${state.iamFilter === v ? "on" : ""}">${esc(l)}</button>`).join("")}
-        </div></div>
-      <div class="table-wrap"><table><thead><tr><th>Principal</th><th>Type</th><th>Storage permissions</th><th>Console MFA</th><th>Access keys</th><th class="num">Policies</th></tr></thead>
-        <tbody id="iam-rows"></tbody></table></div>
-      <div class="muted small" style="margin-top:10px">${r.notes.map(esc).join("<br>")}</div></section>`;
-  state.principals = r.principals;
-  drawPrincipals();
-  animateIn();
-  $("#iam-q").addEventListener("input", (e) => { state.iamQuery = e.target.value; drawPrincipals(); });
 }
 
 function drawPrincipals() {
@@ -1005,17 +973,6 @@ actions["iam-filter"] = (el) => {
   $$(".seg-ctrl button").forEach((b) => b.classList.toggle("on", b === el));
   drawPrincipals();
 };
-actions["iam-analyze"] = async (el) => {
-  await withBusy(el, "Analysing", async () => {
-    try {
-      const { job } = await api(`/api/clouds/${state.cloud}/iam/analyze`, { method: "POST" });
-      await runJob(job, logInto($("#iam-log")));
-      toast("IAM analysis complete", "ok");
-      route();
-    } catch (e) { toast(e.message, "err"); }
-  });
-};
-
 /* -- resource: access & encryption tab */
 function renderAccessTab(box, name, d) {
   const a = d.access, e = a.encryption;
@@ -1137,26 +1094,25 @@ async function renderReports() {
 }
 actions["open-report"] = (el) => { location.hash = `#/reports/${enc(el.dataset.id)}`; };
 
-async function renderReport(id) {
-  const r = await api(`/api/reports/${enc(id)}`);
-  main.innerHTML = `<a class="crumb" href="#/reports">&larr; Reports</a>
-    <div class="page-head"><div><h1 class="mono" style="font-size:16px">${esc(id)}</h1></div><div class="actions">
-      <a class="btn" href="/api/reports/${enc(id)}/download/md">Download .md</a>
-      <a class="btn" href="/api/reports/${enc(id)}/download/json">Download evidence .json</a></div></div>
-    <div class="card report">${r.html}</div>`;
-}
-
 /* ------------------------------------------------------------------ settings */
 const LIST_KINDS = new Set(["region", "profile", "subscription", "project", "bucket"]);
 
 async function renderSettings() {
-  const data = await api("/api/settings");
+  const [data, sched, wv] = await Promise.all([api("/api/settings"), api("/api/schedule").catch(() => ({ installed: false, detail: "" })),
+    api("/api/waivers")]);
+  const plain = data.sections.flatMap((sec) => sec.fields).filter((f) => f.secret && f.stored_in === ".env");
   main.innerHTML = `<div class="page-head"><div><h1>Settings</h1>
-      <div class="sub">Saved to <span class="mono">${esc(data.env_file)}</span>. Cloud secrets stay in each cloud's own credential store unless noted.</div></div></div>
+      <div class="sub">Saved to <span class="mono">${esc(data.env_file)}</span>. Secrets go to ${data.keychain ? "your OS keychain" : ".env (no OS keychain available)"}; cloud credentials stay in each cloud's own store.</div></div>
+      <div class="actions"><a class="btn" href="#/setup">Run setup wizard</a></div></div>
     ${state.status.warnings.map((w) => `<div class="banner warn" style="margin-bottom:12px"><div class="icon">!</div><div>${esc(w)}</div></div>`).join("")}
-    <div class="stack">${data.sections.map(sectionHtml).join("")}</div>`;
+    ${plain.length && data.keychain ? `<div class="banner warn" style="margin-bottom:12px"><div class="icon">!</div><div><strong>${plain.length} secret(s) are stored in plain text in .env</strong>
+      ${plain.map((f) => esc(f.label)).join(", ")}. <button class="btn small" data-action="migrate-secrets">Move to OS keychain</button></div></div>` : ""}
+    <div class="stack">${data.sections.map(sectionHtml).join("")}${scheduleCard(sched)}${waiversCard(wv.waivers)}</div>`;
   $$(".form-row").forEach(bindField);
   $$("input[list]").forEach((input) => { if (["region", "profile"].includes(input.dataset.kind)) loadOptions(input); });
+  bindGcpUpload();
+  const target = location.hash.split("/")[2];
+  if (target) { const el = document.getElementById(`sec-${target}`); if (el) el.scrollIntoView(); }
 }
 
 function sectionHtml(sec) {
@@ -1171,7 +1127,9 @@ function sectionHtml(sec) {
       <span class="muted">or fill in the service principal fields above</span>`,
     gcp: `<span class="muted">Sign in:</span>
       <button class="btn small" data-action="signin" data-cloud="gcp" data-method="cli">gcloud application-default login</button>
-      <span class="muted">or set a service account key file above</span>`,
+      <button class="btn small" data-action="gcp-key">Upload service-account key…</button>
+      <input type="file" id="gcp-key-file" accept=".json,application/json" hidden>
+      <span class="muted">The key is saved in the data folder and used as GOOGLE_APPLICATION_CREDENTIALS.</span>`,
   };
   const c = p ? cloudInfo(p) : null;
   const extra = sec.name === "Alerts"
@@ -1189,6 +1147,8 @@ function fieldHtml(f) {
   if (f.kind === "providers") {
     const on = new Set(f.value.split(",").filter(Boolean));
     ctrl = ["aws", "azure", "gcp"].map((p) => `<label class="check"><input type="checkbox" value="${p}" ${on.has(p) ? "checked" : ""}> ${p.toUpperCase()}</label>`).join("");
+  } else if (f.kind === "bool") {
+    ctrl = `<select>${["on", "off"].map((v) => `<option value="${v}" ${(f.value || f.default) === v ? "selected" : ""}>${v === "on" ? "On" : "Off"}</option>`).join("")}</select>`;
   } else if (f.kind === "int") {
     ctrl = `<input type="number" min="${f.min}" max="${f.max}" value="${esc(f.value || f.default)}">`;
   } else if (f.secret) {
@@ -1203,11 +1163,12 @@ function fieldHtml(f) {
   return `<div class="form-row" data-key="${esc(f.key)}" data-kind="${esc(f.kind)}" data-secret="${f.secret ? 1 : ""}">
     <div><strong>${esc(f.label)}</strong><div class="help">${esc(f.help)}</div></div>
     <div class="ctrl">${ctrl}<button class="btn small primary" data-action="save-field" hidden>Save</button></div>
-    <div class="state" aria-live="polite">${f.is_set ? "" : f.default ? "default" : "not set"}</div></div>`;
+    <div class="state" aria-live="polite">${f.stored_in ? (f.stored_in === "keychain" ? "in OS keychain" : "in .env") : f.is_set ? "" : f.default ? "default" : "not set"}</div></div>`;
 }
 
 function fieldValue(row) {
   if (row.dataset.kind === "providers") return $$("input[type=checkbox]:checked", row).map((i) => i.value).join(",");
+  if (row.dataset.kind === "bool") return $("select", row).value;
   return $("input", row).value;
 }
 
@@ -1215,7 +1176,7 @@ function bindField(row) {
   const saveBtn = $("[data-action=save-field]", row);
   const initial = fieldValue(row);
   const onChange = () => { saveBtn.hidden = row.dataset.secret ? !fieldValue(row) : fieldValue(row) === initial; };
-  $$("input", row).forEach((i) => { i.addEventListener("input", onChange); i.addEventListener("change", onChange); });
+  $$("input, select", row).forEach((i) => { i.addEventListener("input", onChange); i.addEventListener("change", onChange); });
   $$("input[type=text], input[type=number], input[type=password]", row).forEach((i) =>
     i.addEventListener("keydown", (e) => { if (e.key === "Enter" && !saveBtn.hidden) saveField(row, saveBtn); }));
 }
@@ -1225,7 +1186,7 @@ async function saveField(row, btn, value = fieldValue(row)) {
   await withBusy(btn, "Saving", async () => {
     try {
       const f = await api(`/api/settings/${enc(row.dataset.key)}`, { method: "PUT", body: { value } });
-      st.textContent = "saved";
+      st.textContent = f.stored_in === "keychain" ? "saved to OS keychain" : "saved";
       st.className = "state saved";
       if (row.dataset.secret) { $("input", row).value = ""; $("input", row).placeholder = f.is_set ? "set (hidden) - type to replace" : "not set"; }
       btn.hidden = true;
@@ -1313,3 +1274,305 @@ actions["save-keys"] = async (el) => {
 
 /* ------------------------------------------------------------------ boot */
 route();
+
+/* ------------------------------------------------------------------ exports, waivers */
+function exportMenu(cloud) {
+  return `<details class="menu"><summary class="btn">Export</summary><div class="menu-list" role="menu">
+    <a role="menuitem" href="/api/clouds/${enc(cloud)}/export/sarif">SARIF <span class="muted">code scanning</span></a>
+    <a role="menuitem" href="/api/clouds/${enc(cloud)}/export/ocsf">OCSF JSON <span class="muted">SIEM</span></a>
+    <a role="menuitem" href="/api/clouds/${enc(cloud)}/export/csv">CSV <span class="muted">spreadsheet</span></a>
+    <a role="menuitem" href="#" data-action="compliance-report">Compliance report <span class="muted">PDF / Markdown</span></a></div></details>`;
+}
+
+function acceptedList(list) {
+  if (!list || !list.length) return "";
+  return `<section class="card" style="margin-top:16px"><div class="card-head"><h2>Accepted risks (${list.length})</h2>
+      <a class="small-link" href="#/settings/waivers">All waivers</a></div>
+    <p class="muted" style="margin-top:0">These findings are covered by a waiver: they still show here but don't count towards risk, scores, compliance, alerts or exit codes until the waiver expires.</p>
+    <div class="table-wrap"><table><thead><tr><th>Check</th><th>Finding</th><th>Reason</th><th>Expires</th><th></th></tr></thead><tbody>
+    ${list.map((f) => `<tr><td class="mono nowrap">${esc(f.check_id)}</td><td>${sevTag(f.severity)} ${esc(f.title)}</td>
+      <td>${esc(f.waiver.reason)}${f.waiver.check_id === "*" ? ` <span class="chip">all checks</span>` : ""}</td>
+      <td class="nowrap">${esc(f.waiver.expires)}</td>
+      <td><button class="btn small" data-action="unwaive" data-id="${esc(f.waiver.id)}">Remove</button></td></tr>`).join("")}
+    </tbody></table></div></section>`;
+}
+
+function isoIn(days) {
+  const d = new Date(Date.now() + days * 86400000);
+  return d.toISOString().slice(0, 10);
+}
+
+actions.waive = (el) => {
+  const dlg = $("#dialog");
+  const { resource, check, title } = el.dataset;
+  dlg.innerHTML = `<form method="dialog"><div class="d-body">
+      <h2>Accept this risk?</h2>
+      <p class="secondary" style="margin-top:0">For things that are intended, like a public website bucket. The finding stays visible but stops counting towards scores, compliance and alerts until the expiry date.</p>
+      <p><strong>${esc(check)}</strong> ${esc(title)}<br><span class="muted mono">${esc(resource)}</span></p>
+      <label class="check"><input type="radio" name="w-scope" value="${esc(check)}" checked> Only this check</label><br>
+      <label class="check"><input type="radio" name="w-scope" value="*"> Every check on ${esc(resource)}</label>
+      <label style="display:block;margin-top:12px">Reason<input type="text" id="w-reason" maxlength="500" placeholder="e.g. public website assets, reviewed by security" autocomplete="off"></label>
+      <label style="display:block;margin-top:10px">Valid until<input type="date" id="w-expires" value="${isoIn(90)}" min="${isoIn(0)}" max="${isoIn(730)}"></label>
+    </div><div class="d-foot"><button class="btn" value="cancel">Cancel</button>
+      <button class="btn primary" id="w-ok" value="ok" disabled>Accept risk</button></div></form>`;
+  const reason = $("#w-reason", dlg);
+  reason.addEventListener("input", () => { $("#w-ok", dlg).disabled = reason.value.trim().length < 5; });
+  dlg.addEventListener("close", async () => {
+    if (dlg.returnValue !== "ok") return;
+    try {
+      await api("/api/waivers", { method: "POST", body: { provider: state.cloud, resource, check_id: $("input[name=w-scope]:checked", dlg).value,
+        reason: reason.value.trim(), expires: $("#w-expires", dlg).value } });
+      toast("Risk accepted", "ok");
+      await refreshStatus();
+      route();
+    } catch (e) { toast(e.message, "err"); }
+  }, { once: true });
+  dlg.showModal();
+  reason.focus();
+};
+
+actions.unwaive = async (el) => {
+  try {
+    await api(`/api/waivers/${enc(el.dataset.id)}`, { method: "DELETE" });
+    toast("Waiver removed", "ok");
+    await refreshStatus();
+    route();
+  } catch (e) { toast(e.message, "err"); }
+};
+
+/* ------------------------------------------------------------------ account & IAM page */
+async function renderIam() {
+  const c = cloudInfo();
+  const head = `<div class="page-head"><div><h1>Account &amp; IAM</h1>
+      <div class="sub">${esc(c.display)} · who can reach your storage, plus account-wide checks: audit logging, root/owner security, network exposure, public databases and snapshots, key rotation.</div></div>
+      <div class="actions">${c.connected || c.scanned_at ? `<button class="btn" data-action="iam-analyze">Re-run account checks</button>` : ""}</div></div>
+    <div id="iam-log" class="log" hidden></div>`;
+  const data = await api(`/api/clouds/${c.name}/account`);
+  if (!data.report) {
+    main.innerHTML = `${head}<div class="card empty"><h2>${data.enabled ? "Not checked yet" : "Account-wide checks are off"}</h2>
+      <p>${data.enabled ? "Account-wide checks run with every scan. They are read-only and use the same permissions as the scan (SecurityAudit / Reader / Security Reviewer)."
+        : "Turn on 'Account-wide checks' in Settings > General."}</p>
+      ${data.enabled ? `<button class="btn primary" data-action="scan">Scan now</button><div id="scan-progress" class="log" hidden></div>` : `<a class="btn" href="#/settings">Settings</a>`}</div>`;
+    return;
+  }
+  const r = data.report;
+  const k = r.iam ? r.iam.counts : null;
+  const sev = (s) => r.findings.filter((f) => f.severity === s).length;
+  const tile = (label, value, note, cls = "") => `<div class="kpi ${cls}"><div class="label">${esc(label)}</div>
+    <div class="value"><span data-count="${value}">${nf.format(value)}</span></div><div class="note">${note}</div></div>`;
+  const errors = Object.entries(r.errors || {});
+  main.innerHTML = `${head}
+    ${errors.length ? `<div class="banner warn" style="margin-bottom:16px"><div class="icon">!</div><div><strong>${errors.length} area(s) could not be checked</strong>
+      ${errors.slice(0, 6).map(([a, e]) => `${esc(a)}: <span class="muted">${esc(String(e).slice(0, 140))}</span>`).join("<br>")}</div></div>` : ""}
+    <section class="kpis iam">
+      ${tile("Account-wide findings", r.findings.length, `${sev("CRITICAL")} critical · ${sev("HIGH")} high · ${sev("MEDIUM")} medium`, r.findings.some((f) => ["CRITICAL", "HIGH"].includes(f.severity)) ? "hero alert" : "hero")}
+      ${k ? tile("Principals analysed", k.principals, `${nf.format(k.users)} users · ${nf.format(k.roles)} roles/other`) : tile("Accepted risks", r.waived.length, "covered by waivers")}
+      ${k ? tile("Flagged principals", k.risky, k.risky ? badge("Review needed", "crit") : badge("Nothing flagged", "good")) : ""}
+      ${k ? tile("Admin or full storage access", k.admin + k.s3_full, `${nf.format(k.admin)} administrator(s) · ${nf.format(k.s3_full)} with full storage access`) : ""}
+      ${k ? tile("Can make buckets public", k.can_expose, "change policies, ACLs or public access settings") : ""}
+      ${k ? tile("Stale credentials", k.no_mfa + k.old_keys, `${nf.format(k.no_mfa)} console user(s) without MFA · ${nf.format(k.old_keys)} key(s) over 90 days`) : ""}
+    </section>
+    <section style="margin-top:16px"><h2>Findings</h2>
+      ${r.findings.length ? r.findings.map((f) => findingCard(f, true)).join("") : `<div class="card empty"><h2>No account-wide findings</h2><p>Every account-wide check passed.</p></div>`}</section>
+    ${acceptedList(r.waived)}
+    ${r.iam ? `<section class="card" style="margin-top:16px"><div class="card-head"><h2>Principals</h2></div>
+      <div class="toolbar">
+        <input type="search" id="iam-q" placeholder="Filter by name" value="${esc(state.iamQuery)}" aria-label="Filter principals">
+        <div class="seg-ctrl" role="group" aria-label="Principal filter">
+          ${[["flagged", `Flagged (${k.risky})`], ["all", `All (${k.principals})`], ["user", "Users"], ["role", "Roles"]].map(([v, l]) =>
+            `<button data-action="iam-filter" data-v="${v}" class="${state.iamFilter === v ? "on" : ""}">${esc(l)}</button>`).join("")}
+        </div></div>
+      <div class="table-wrap"><table><thead><tr><th>Principal</th><th>Type</th><th>Storage permissions</th><th>Console MFA</th><th>Keys</th><th class="num">Policies</th></tr></thead>
+        <tbody id="iam-rows"></tbody></table></div></section>` : ""}
+    <p class="muted small" style="margin-top:12px">${r.notes.map(esc).join("<br>")}</p>`;
+  if (r.iam) {
+    state.principals = r.iam.principals;
+    drawPrincipals();
+    $("#iam-q").addEventListener("input", (e) => { state.iamQuery = e.target.value; drawPrincipals(); });
+  }
+  animateIn();
+}
+
+actions["iam-analyze"] = async (el) => {
+  await withBusy(el, "Checking", async () => {
+    try {
+      const { job } = await api(`/api/clouds/${state.cloud}/account/analyze`, { method: "POST" });
+      await runJob(job, logInto($("#iam-log")));
+      toast("Account checks complete", "ok");
+      route();
+    } catch (e) { toast(e.message, "err"); }
+  });
+};
+
+/* ------------------------------------------------------------------ report page: PDF + rollback */
+async function renderReport(id) {
+  const r = await api(`/api/reports/${enc(id)}`);
+  const rb = r.rollback;
+  main.innerHTML = `<a class="crumb" href="#/reports">&larr; Reports</a>
+    <div class="page-head"><div><h1 class="mono" style="font-size:16px">${esc(id)}</h1></div><div class="actions">
+      <a class="btn" href="/api/reports/${enc(id)}/download/pdf">Download PDF</a>
+      <a class="btn" href="/api/reports/${enc(id)}/download/md">Markdown</a>
+      <a class="btn" href="/api/reports/${enc(id)}/download/json">Evidence JSON</a>
+      ${r.can_rollback ? `<button class="btn danger" data-action="rollback" data-id="${esc(id)}" data-name="${esc(r.resource)}">Roll back…</button>` : ""}</div></div>
+    ${rb ? `<div class="banner ${rb.status === "applied" ? "warn" : "crit"}" style="margin-bottom:16px"><div class="icon">↺</div><div>
+      <strong>Rolled back ${esc(timeAgo(rb.at))} (${esc(rb.status)})</strong>The configuration from before remediation was restored.</div></div>` : ""}
+    <div id="rollback-box"></div>
+    <div class="card report">${r.html}</div>`;
+}
+
+actions.rollback = async (el) => {
+  const { id, name } = el.dataset;
+  const box = $("#rollback-box");
+  let plan;
+  try {
+    plan = await api(`/api/reports/${enc(id)}/rollback`, { method: "POST", body: { dry_run: true } });
+  } catch (e) { toast(e.message, "err"); return; }
+  const dlg = $("#dialog");
+  dlg.innerHTML = `<form method="dialog"><div class="d-body">
+      <h2>Roll back remediation?</h2>
+      <p class="secondary" style="margin-top:0">This restores the configuration saved before remediation on <strong>${esc(name)}</strong>.
+        <strong>If it was public, it becomes public again.</strong></p>
+      ${actionsTable(plan.actions)}
+      <label style="display:block;margin-top:12px">Type <strong class="mono">${esc(name)}</strong> to confirm<input type="text" id="rb-name" autocomplete="off" spellcheck="false"></label>
+    </div><div class="d-foot"><button class="btn" value="cancel">Cancel</button>
+      <button class="btn danger" id="rb-ok" value="ok" disabled>Roll back</button></div></form>`;
+  const input = $("#rb-name", dlg);
+  input.addEventListener("input", () => { $("#rb-ok", dlg).disabled = input.value.trim() !== name; });
+  dlg.addEventListener("close", async () => {
+    if (dlg.returnValue !== "ok") return;
+    try {
+      const res = await api(`/api/reports/${enc(id)}/rollback`, { method: "POST", body: { confirm_name: input.value.trim() } });
+      box.innerHTML = `<div class="card" style="margin-bottom:16px"><h2>Rollback result</h2>${actionsTable(res.actions)}</div>`;
+      toast("Rolled back", "ok");
+      await refreshStatus();
+      setTimeout(route, 1200);
+    } catch (e) { toast(e.message, "err"); }
+  }, { once: true });
+  dlg.showModal();
+  input.focus();
+};
+
+/* ------------------------------------------------------------------ settings extras */
+function scheduleCard(st) {
+  const clouds = state.status.default_providers;
+  return `<section class="card" id="sec-schedule"><div class="card-head"><h2>Scheduled scans</h2>
+      ${st.installed ? badge("Installed", "good") : badge("Not installed", "neutral")}</div>
+    <p class="muted" style="margin-top:0">Runs a scan automatically with ${navigator.userAgent.includes("Windows") ? "Windows Task Scheduler" : "cron"},
+      even when this dashboard is closed. History, drift detection and webhook alerts work as usual; results show here next time.</p>
+    ${st.installed ? `<p class="small">${esc(st.detail)}</p>` : ""}
+    <div class="toolbar">
+      <label>Every <select id="sch-every">
+        ${[[60, "hour"], [240, "4 hours"], [720, "12 hours"], [1440, "day"], [10080, "week"]].map(([v, l]) => `<option value="${v}" ${v === 1440 ? "selected" : ""}>${l}</option>`).join("")}
+      </select></label>
+      <span class="muted">clouds: ${esc(clouds.join(", ").toUpperCase())}</span>
+      <label class="check"><input type="checkbox" id="sch-all"> all accounts</label>
+      <button class="btn small primary" data-action="schedule-install">${st.installed ? "Update schedule" : "Install schedule"}</button>
+      ${st.installed ? `<button class="btn small" data-action="schedule-remove">Remove</button>` : ""}
+    </div></section>`;
+}
+
+function waiversCard(list) {
+  return `<section class="card" id="sec-waivers"><div class="card-head"><h2>Accepted risks (waivers)</h2><span class="muted">${list.length} total</span></div>
+    ${list.length ? `<div class="table-wrap"><table><thead><tr><th>Cloud</th><th>Resource</th><th>Check</th><th>Reason</th><th>Expires</th><th></th></tr></thead><tbody>
+      ${list.map((w) => `<tr><td>${esc(w.provider.toUpperCase())}</td><td class="mono small">${esc(w.resource)}</td><td class="mono">${esc(w.check_id)}</td>
+        <td>${esc(w.reason)}</td><td class="nowrap">${w.expired ? badge(`expired ${w.expires}`, "warn") : esc(w.expires)}</td>
+        <td><button class="btn small" data-action="unwaive" data-id="${esc(w.id)}">Remove</button></td></tr>`).join("")}</tbody></table></div>`
+      : `<p class="muted">None yet. Use "Accept risk" on a finding when something is intended, like a public website bucket.</p>`}</section>`;
+}
+
+actions["schedule-install"] = async (el) => {
+  await withBusy(el, "Installing", async () => {
+    try {
+      const r = await api("/api/schedule", { method: "POST", body: { every: Number($("#sch-every").value),
+        providers: state.status.default_providers, all_accounts: $("#sch-all").checked } });
+      toast(r.message, "ok");
+      renderSettings();
+    } catch (e) { toast(e.message, "err"); }
+  });
+};
+actions["schedule-remove"] = async (el) => {
+  await withBusy(el, "Removing", async () => {
+    try { toast((await api("/api/schedule", { method: "DELETE" })).message, "ok"); renderSettings(); } catch (e) { toast(e.message, "err"); }
+  });
+};
+actions["migrate-secrets"] = async (el) => {
+  await withBusy(el, "Moving", async () => {
+    try {
+      const r = await api("/api/settings/migrate-secrets", { method: "POST" });
+      toast(r.moved.length ? `Moved to the OS keychain: ${r.moved.join(", ")}` : "Nothing to move", "ok");
+      renderSettings();
+    } catch (e) { toast(e.message, "err"); }
+  });
+};
+actions["gcp-key"] = () => $("#gcp-key-file").click();
+
+function bindGcpUpload() {
+  const input = $("#gcp-key-file");
+  if (!input) return;
+  input.addEventListener("change", async () => {
+    const file = input.files[0];
+    if (!file) return;
+    if (file.size > 32 * 1024) { toast("That file is too large to be a service-account key.", "err"); return; }
+    try {
+      const r = await api("/api/settings/gcp-key", { method: "POST", body: { content: await file.text() } });
+      toast(`Key for ${r.client_email} saved (project ${r.project})`, "ok");
+      await refreshStatus();
+      await renderSettings();
+      actions.test($("[data-action=test][data-cloud=gcp]"));
+    } catch (e) { toast(e.message, "err"); }
+    input.value = "";
+  });
+}
+
+/* ------------------------------------------------------------------ first-run setup wizard */
+const SETUP_STEPS = [["clouds", "Choose clouds"], ["signin", "Sign in"], ["options", "Options"], ["done", "Scan"]];
+
+async function renderSetup(step) {
+  const steps = `<ol class="steps">${SETUP_STEPS.map(([k, l], i) => `<li class="${k === step ? "on" : ""}"><span>${i + 1}</span>${esc(l)}</li>`).join("")}</ol>`;
+  const head = `<div class="page-head"><div><h1>Set up CloudDetectX</h1>
+      <div class="sub">A few steps to connect your clouds. Everything is stored locally; cloud credentials stay in each cloud's own store.</div></div>
+      <div class="actions"><button class="btn" data-action="setup-skip">Skip setup</button></div></div>${steps}`;
+  const data = await api("/api/settings");
+  const section = (name) => data.sections.find((s) => s.name === name);
+  const chosen = section("General").fields.find((f) => f.key === "CLOUDDETECTX_PROVIDERS").value.split(",").filter(Boolean);
+  let body = "";
+  if (step === "clouds") {
+    body = `<div class="card"><h2>Which clouds do you use?</h2>
+      <div class="toolbar" id="setup-clouds">${[["aws", "Amazon Web Services"], ["azure", "Microsoft Azure"], ["gcp", "Google Cloud"]].map(([k, l]) =>
+        `<label class="check pick"><input type="checkbox" value="${k}" ${chosen.includes(k) ? "checked" : ""}> ${l}</label>`).join("")}</div>
+      <button class="btn primary" data-action="setup-clouds">Next</button></div>`;
+  } else if (step === "signin") {
+    body = `<p class="secondary">Sign in to each cloud, then use <strong>Test connection</strong>. Scans are read-only.</p>
+      <div class="stack">${chosen.map((p) => sectionHtml(section({ aws: "AWS", azure: "Azure", gcp: "GCP" }[p]))).join("")}</div>
+      <div style="margin-top:16px"><a class="btn primary" href="#/setup/options">Next</a></div>`;
+  } else if (step === "options") {
+    body = `<div class="stack">${["Investigation", "Alerts"].map((n) => sectionHtml(section(n))).join("")}</div>
+      <div style="margin-top:16px"><a class="btn" href="#/setup/signin">Back</a> <a class="btn primary" href="#/setup/done">Next</a></div>`;
+  } else {
+    body = `<div class="card empty"><h2>You're set</h2><p>Run the first scan now. It reads configuration only and changes nothing.</p>
+      <button class="btn primary" data-action="setup-finish">Go to the dashboard and scan</button></div>`;
+  }
+  main.innerHTML = head + body;
+  $$(".form-row").forEach(bindField);
+  bindGcpUpload();
+}
+
+actions["setup-clouds"] = async (el) => {
+  const picked = $$("#setup-clouds input:checked").map((i) => i.value);
+  if (!picked.length) { toast("Choose at least one cloud", "err"); return; }
+  await withBusy(el, "Saving", async () => {
+    try {
+      await api("/api/settings/CLOUDDETECTX_PROVIDERS", { method: "PUT", body: { value: picked.join(",") } });
+      await refreshStatus();
+      location.hash = "#/setup/signin";
+    } catch (e) { toast(e.message, "err"); }
+  });
+};
+actions["setup-skip"] = () => { store("clouddetectx.setup-skipped", "1"); location.hash = "#/dashboard"; };
+actions["setup-finish"] = async () => {
+  store("clouddetectx.setup-skipped", "1");
+  await refreshStatus();
+  state.cloud = state.status.default_providers[0] || "aws";
+  location.hash = "#/dashboard";
+  setTimeout(() => { const b = $("[data-action=scan]"); if (b) actions.scan(b); }, 300);
+};

@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clouddetectx"
+dynamic = ["version"]
+description = "Find exposed cloud storage, prove what's reachable and inside, investigate access, and fix it - AWS, Azure and GCP."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "dipanshwave" }]
+keywords = ["security", "cloud", "s3", "azure", "gcp", "cspm", "compliance", "incident-response"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+]
+# Compatible ranges for installs; requirements.txt pins the exact tested versions.
+dependencies = [
+    "rich>=13,<16",
+    "questionary>=2,<3",
+    "python-dotenv>=1,<2",
+    "keyring>=24,<26",
+    "requests>=2.31,<3",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "markdown>=3.5,<4",
+    "nh3>=0.2,<1",
+    "fpdf2>=2.7,<3",
+    "pypdf>=4,<8",
+    "pyarrow>=14",
+    "boto3>=1.34,<2",
+    "azure-identity>=1.15,<2",
+    "azure-mgmt-storage>=21",
+    "azure-mgmt-monitor>=6",
+    "azure-monitor-query>=1.2",
+    "azure-storage-blob>=12.19,<13",
+    "google-cloud-storage>=2.14,<4",
+    "google-cloud-logging>=3.9,<4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "moto[all]>=5,<6", "httpx>=0.27"]
+
+[project.scripts]
+clouddetectx = "clouddetectx.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dipanshwave/CloudDetectX-exposure-detector"
+
+[tool.setuptools.dynamic]
+version = { attr = "clouddetectx.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["clouddetectx*"]
+
+[tool.setuptools.package-data]
+"clouddetectx.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -34,7 +34,7 @@ ADMIN_PROBES = ("iam:PutUserPolicy", "iam:CreateAccessKey", "s3:GetObject", "ec2
 
 CAPABILITY_LABELS = {
     "admin": "Full administrator",
-    "s3_full": "Full S3 access",
+    "s3_full": "Full storage access",
     "read_all": "Read every bucket",
     "write_all": "Write/delete in every bucket",
     "can_expose": "Can make buckets public",

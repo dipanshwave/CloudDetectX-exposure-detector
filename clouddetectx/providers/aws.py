@@ -10,6 +10,7 @@ import copy
 import gzip
 import json
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -165,6 +166,8 @@ def encryption_summary(cfg: dict) -> dict:
         "kms_key": default.get("KMSMasterKeyID"),
         "bucket_key": rule.get("BucketKeyEnabled"),
         "in_transit_enforced": tls_enforced(cfg.get("policy")),
+        "object_lock": cfg.get("object_lock"),
+        "mfa_delete": cfg.get("mfa_delete"),
     }
 
 
@@ -245,7 +248,7 @@ class AWSProvider(StorageProvider):
     name = "aws"
     display_name = "Amazon Web Services (S3)"
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, session=None):
         try:
             import boto3
             from botocore.config import Config
@@ -253,24 +256,28 @@ class AWSProvider(StorageProvider):
             raise ProviderError("boto3 is not installed. Run: pip install -r requirements.txt") from exc
 
         self.settings = settings
-        self._boto_config = Config(retries={"max_attempts": 8, "mode": "adaptive"}, connect_timeout=10, read_timeout=60)
+        self._boto_config = Config(retries={"max_attempts": 8, "mode": "adaptive"}, connect_timeout=10, read_timeout=60,
+                                   max_pool_connections=max(10, settings.scan_workers * 2))
         from botocore.exceptions import ProfileNotFound
 
         try:
-            self.session = boto3.session.Session(profile_name=settings.aws_profile, region_name=settings.aws_region)
+            self.session = session or boto3.session.Session(profile_name=settings.aws_profile, region_name=settings.aws_region)
         except ProfileNotFound as exc:
             raise ProviderError(f"{exc}. Check AWS_PROFILE in .env or run `aws configure list-profiles`.") from exc
         self._clients: dict[tuple[str, str], Any] = {}
+        self._client_lock = threading.Lock()
         self._identity: dict | None = None
         self._account_pab: dict | None | bool = False  # False = not fetched yet
+        self._cloudfront: list | None = None
 
     # -- clients -------------------------------------------------------------
     def _client(self, service: str, region: str | None = None):
         region = region or self.session.region_name or "us-east-1"
         key = (service, region)
-        if key not in self._clients:
-            self._clients[key] = self.session.client(service, region_name=region, config=self._boto_config)
-        return self._clients[key]
+        with self._client_lock:     # boto3 sessions are not thread-safe; clients are
+            if key not in self._clients:
+                self._clients[key] = self.session.client(service, region_name=region, config=self._boto_config)
+            return self._clients[key]
 
     def _identity_info(self) -> dict:
         if self._identity is None:
@@ -290,6 +297,51 @@ class AWSProvider(StorageProvider):
     def account_label(self) -> str:
         ident = self._identity_info()
         return f"AWS account {ident['Account']} as {ident['Arn']}"
+
+    def account_id(self) -> str:
+        return self._identity_info()["Account"]
+
+    # -- multi-account (AWS Organizations) ------------------------------------------
+    def list_accounts(self) -> list[dict]:
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            out = []
+            for page in self._client("organizations", "us-east-1").get_paginator("list_accounts").paginate():
+                out += [{"id": a["Id"], "name": a.get("Name") or a["Id"]} for a in page.get("Accounts", [])
+                        if a.get("Status", "ACTIVE") == "ACTIVE"]
+            return out
+        except (ClientError, BotoCoreError) as exc:
+            raise ProviderError(
+                f"Cannot list AWS Organizations accounts ({_error_code(exc)}). Run from the management account or a "
+                "delegated administrator with organizations:ListAccounts.") from exc
+
+    def for_account(self, account_id: str) -> "AWSProvider":
+        if account_id == self.account_id():
+            return self
+        role = self.settings.aws_org_role
+        if not role:
+            raise ProviderError("Set 'Member-account role' (Settings > AWS) to scan other accounts, e.g. a read-only "
+                                "role named CloudDetectXAudit with the SecurityAudit policy in every member account.")
+        import boto3
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            creds = self._client("sts").assume_role(
+                RoleArn=f"arn:aws:iam::{account_id}:role/{role}", RoleSessionName="clouddetectx",
+                DurationSeconds=3600)["Credentials"]
+        except (ClientError, BotoCoreError) as exc:
+            raise ProviderError(f"Cannot assume role {role} in account {account_id}: {_error_code(exc)}") from exc
+        session = boto3.session.Session(aws_access_key_id=creds["AccessKeyId"],
+                                        aws_secret_access_key=creds["SecretAccessKey"],
+                                        aws_session_token=creds["SessionToken"],
+                                        region_name=self.session.region_name)
+        return AWSProvider(self.settings, session=session)
+
+    def account_checks(self):
+        from clouddetectx.checks import aws_account
+
+        return aws_account.run(self)
 
     # -- identity (IAM) -------------------------------------------------------------
     def analyze_identity(self):
@@ -338,7 +390,8 @@ class AWSProvider(StorageProvider):
         return {None: "us-east-1", "": "us-east-1", "EU": "eu-west-1"}.get(loc, loc)
 
     def _resource(self, bucket: str, region: str | None) -> Resource:
-        return Resource(provider="aws", name=bucket, resource_id=f"arn:aws:s3:::{bucket}", location=region)
+        return Resource(provider="aws", name=bucket, resource_id=f"arn:aws:s3:::{bucket}", location=region,
+                        account=self._identity_info()["Account"])
 
     def list_resources(self) -> list[Resource]:
         self._identity_info()
@@ -416,13 +469,20 @@ class AWSProvider(StorageProvider):
         enc = fetch("encryption", lambda: s3.get_bucket_encryption(Bucket=bucket),
                     ("ServerSideEncryptionConfigurationNotFoundError",))
         cfg["encryption"] = (enc or {}).get("ServerSideEncryptionConfiguration", {}).get("Rules")
-        cfg["encryption_summary"] = encryption_summary(cfg)
 
         ver = fetch("versioning", lambda: s3.get_bucket_versioning(Bucket=bucket))
         cfg["versioning"] = (ver or {}).get("Status", "Disabled")
 
         log = fetch("logging", lambda: s3.get_bucket_logging(Bucket=bucket))
         cfg["logging"] = (log or {}).get("LoggingEnabled")
+        cfg["mfa_delete"] = (ver or {}).get("MFADelete") == "Enabled"
+
+        lock = fetch("object_lock", lambda: s3.get_object_lock_configuration(Bucket=bucket),
+                     ("ObjectLockConfigurationNotFoundError", "NoSuchObjectLockConfiguration"))
+        cfg["object_lock"] = ((lock or {}).get("ObjectLockConfiguration") or {}).get("ObjectLockEnabled") == "Enabled"
+        cfg["access_points"] = self._access_points(bucket, resource.location, posture)
+        cfg["cloudfront"] = self._cloudfront_origins(bucket, posture)
+        cfg["encryption_summary"] = encryption_summary(cfg)
 
         cfg["public_objects"] = []
         cfg["objects_inspected"] = 0
@@ -436,6 +496,53 @@ class AWSProvider(StorageProvider):
                     cfg["public_objects"].append({"key": obj["Key"], "owner": oacl.get("Owner"), "grants": oacl["Grants"]})
             cfg["objects_truncated"] = bool((listing or {}).get("IsTruncated"))
         return posture
+
+    def _access_points(self, bucket: str, region: str | None, posture: Posture) -> list[dict]:
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        out = []
+        try:
+            ctl = self._client("s3control", region)
+            account = self.account_id()
+            for ap in ctl.list_access_points(AccountId=account, Bucket=bucket).get("AccessPointList", []):
+                status = {}
+                try:
+                    status = ctl.get_access_point_policy_status(AccountId=account, Name=ap["Name"]).get("PolicyStatus", {})
+                except ClientError as exc:
+                    if _error_code(exc) not in ("NoSuchAccessPointPolicy",):
+                        raise
+                detail = ctl.get_access_point(AccountId=account, Name=ap["Name"])
+                out.append({"name": ap["Name"], "network_origin": ap.get("NetworkOrigin"),
+                            "policy_is_public": bool(status.get("IsPublic")),
+                            "block_public_access": detail.get("PublicAccessBlockConfiguration") or {}})
+        except (ClientError, BotoCoreError) as exc:
+            posture.errors["access_points"] = _error_code(exc)
+        return out
+
+    def _cloudfront_origins(self, bucket: str, posture: Posture) -> list[dict]:
+        """CloudFront distributions whose origin is this bucket, and whether they use OAC/OAI."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        if self._cloudfront is None:
+            dists = []
+            try:
+                for page in self._client("cloudfront", "us-east-1").get_paginator("list_distributions").paginate():
+                    dists += (page.get("DistributionList") or {}).get("Items", []) or []
+            except (ClientError, BotoCoreError) as exc:
+                posture.errors["cloudfront"] = _error_code(exc)
+            self._cloudfront = dists
+        out = []
+        prefixes = (f"{bucket}.s3.", f"{bucket}.s3-")
+        for d in self._cloudfront:
+            for o in (d.get("Origins") or {}).get("Items", []) or []:
+                domain = (o.get("DomainName") or "").lower()
+                if not domain.startswith(prefixes):
+                    continue
+                oai = ((o.get("S3OriginConfig") or {}).get("OriginAccessIdentity") or "").strip()
+                out.append({"distribution": d.get("Id"), "domain": d.get("DomainName"), "origin": domain,
+                            "protected": bool(o.get("OriginAccessControlId") or oai),
+                            "website_endpoint": "s3-website" in domain})
+        return out
 
     # -- evaluation --------------------------------------------------------------
     @staticmethod
@@ -563,6 +670,46 @@ class AWSProvider(StorageProvider):
                 recommendation="Confirm each external account is a trusted partner. Otherwise remove it, or limit the "
                                "statement with aws:PrincipalOrgID and the narrowest actions possible.",
                 evidence={"statements": cross},
+            ))
+
+        public_aps = [a for a in cfg.get("access_points", [])
+                      if a["policy_is_public"] and a.get("network_origin") == "Internet"
+                      and not (a.get("block_public_access") or {}).get("RestrictPublicBuckets")]
+        if public_aps:
+            effective = not restrict_policy
+            findings.append(Finding(
+                check_id="AWS-S3-010",
+                title="Access point policy allows public access",
+                severity=Severity.CRITICAL if effective else Severity.LOW,
+                description=f"{len(public_aps)} internet-facing access point(s) have a public policy: "
+                            + ", ".join(a["name"] for a in public_aps[:5])
+                            + ("." if effective else ". Currently neutralised by RestrictPublicBuckets."),
+                recommendation="Restrict the access point policy, set its Block Public Access, or make it VPC-only.",
+                exposes_data=effective,
+                evidence={"access_points": public_aps},
+            ))
+
+        unprotected = [c for c in cfg.get("cloudfront", []) if not c["protected"]]
+        if unprotected:
+            findings.append(Finding(
+                check_id="AWS-S3-011",
+                title="Served through CloudFront without origin access control",
+                severity=Severity.MEDIUM,
+                description=f"{len(unprotected)} CloudFront distribution(s) read this bucket without OAC/OAI, which "
+                            "only works if the bucket itself is public, so the CDN can be bypassed: "
+                            + ", ".join(c["distribution"] or "?" for c in unprotected[:5]) + ".",
+                recommendation="Add an Origin Access Control to the distribution, allow only it in the bucket policy, "
+                               "and turn Block Public Access back on.",
+                evidence={"distributions": unprotected},
+            ))
+
+        if not cfg.get("object_lock") and not cfg.get("mfa_delete"):
+            findings.append(Finding(
+                check_id="AWS-S3-012",
+                title="No Object Lock or MFA Delete",
+                severity=Severity.INFO,
+                description="Someone with write access (or stolen credentials) can permanently delete objects and versions.",
+                recommendation="For backups and audit data, enable Object Lock (new buckets) or MFA Delete.",
             ))
 
         if cfg.get("versioning") != "Enabled":
@@ -757,15 +904,15 @@ class AWSProvider(StorageProvider):
         s3 = self._client("s3", posture.resource.location)
         actions: list[RemediationAction] = []
 
-        def run(action: str, detail: str, before: Any, fn):
+        def run(action: str, detail: str, before: Any, fn, op: str = "", target: str = ""):
             if dry_run:
-                actions.append(RemediationAction(action, "planned", detail, before))
+                actions.append(RemediationAction(action, "planned", detail, before, op, target))
                 return
             try:
                 fn()
-                actions.append(RemediationAction(action, "applied", detail, before))
+                actions.append(RemediationAction(action, "applied", detail, before, op, target))
             except ClientError as exc:
-                actions.append(RemediationAction(action, "failed", f"{detail} -> {_error_code(exc)}: {exc}", before))
+                actions.append(RemediationAction(action, "failed", f"{detail} -> {_error_code(exc)}: {exc}", before, op, target))
 
         # 1. Containment first: Block Public Access overrides public ACLs and policies immediately.
         current_pab = cfg.get("public_access_block") or {}
@@ -777,6 +924,7 @@ class AWSProvider(StorageProvider):
                 lambda: s3.put_public_access_block(
                     Bucket=bucket, PublicAccessBlockConfiguration={f: True for f in PAB_FLAGS}
                 ),
+                "s3.public_access_block",
             )
 
         acls_disabled = cfg.get("object_ownership") == "BucketOwnerEnforced"
@@ -792,6 +940,7 @@ class AWSProvider(StorageProvider):
                 lambda: s3.put_bucket_acl(
                     Bucket=bucket, AccessControlPolicy={"Owner": cfg["acl_owner"], "Grants": kept}
                 ),
+                "s3.bucket_acl",
             )
 
         # 3. Strip public statements from the bucket policy (and, with --harden, require HTTPS).
@@ -815,10 +964,10 @@ class AWSProvider(StorageProvider):
                 if public_stmts and add_tls:
                     title += " and require HTTPS"
                 run(title, "; ".join(changes).capitalize() + f" ({len(new_policy['Statement'])} statement(s) after)",
-                    policy, lambda: s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps(new_policy)))
+                    policy, lambda: s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps(new_policy)), "s3.bucket_policy")
             else:
                 run("Delete the bucket policy", "Every statement in the policy was public",
-                    policy, lambda: s3.delete_bucket_policy(Bucket=bucket))
+                    policy, lambda: s3.delete_bucket_policy(Bucket=bucket), "s3.bucket_policy")
 
         # 4. Reset public object ACLs.
         if not acls_disabled:
@@ -831,6 +980,7 @@ class AWSProvider(StorageProvider):
                     lambda o=obj, k=kept: s3.put_object_acl(
                         Bucket=bucket, Key=o["key"], AccessControlPolicy={"Owner": o["owner"], "Grants": k}
                     ),
+                    "s3.object_acl", obj["key"],
                 )
 
         # 5. Optional hardening.
@@ -842,11 +992,53 @@ class AWSProvider(StorageProvider):
                         ServerSideEncryptionConfiguration={
                             "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
                         },
-                    ))
+                    ), "s3.encryption")
             if cfg.get("versioning") != "Enabled":
                 run("Enable bucket versioning", "s3:PutBucketVersioning Enabled", cfg.get("versioning"),
-                    lambda: s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"}))
+                    lambda: s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"}),
+                    "s3.versioning")
 
         if not actions:
             actions.append(RemediationAction("No change required", "skipped", "Bucket has no public exposure to remove."))
         return actions
+
+    def rollback(self, resource: Resource, applied: list[dict], dry_run: bool):
+        """Restore the configuration saved in a report's applied actions (given newest first)."""
+        from botocore.exceptions import ClientError
+
+        bucket = resource.name
+        s3 = self._client("s3", resource.location)
+        out: list[RemediationAction] = []
+        for a in applied:
+            op, before, target = a.get("op"), a.get("before"), a.get("target") or ""
+            title = f"Undo: {a.get('action')}"
+            if op == "s3.public_access_block":
+                fn = ((lambda b=before: s3.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration=b))
+                      if before else (lambda: s3.delete_public_access_block(Bucket=bucket)))
+                detail = "Restore previous bucket Block Public Access" if before else "Remove bucket Block Public Access"
+            elif op == "s3.bucket_acl":
+                fn, detail = (lambda b=before: s3.put_bucket_acl(Bucket=bucket, AccessControlPolicy=b)), "Restore previous bucket ACL"
+            elif op == "s3.bucket_policy":
+                fn = ((lambda b=before: s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps(b)))
+                      if before else (lambda: s3.delete_bucket_policy(Bucket=bucket)))
+                detail = "Restore previous bucket policy" if before else "Delete the bucket policy (there was none)"
+            elif op == "s3.object_acl":
+                fn = lambda b=before, k=target: s3.put_object_acl(Bucket=bucket, Key=k, AccessControlPolicy=b)  # noqa: E731
+                detail = f"Restore previous ACL on {target}"
+            elif op == "s3.encryption":
+                fn, detail = (lambda: s3.delete_bucket_encryption(Bucket=bucket)), "Remove default encryption setting (S3 still encrypts with SSE-S3)"
+            elif op == "s3.versioning":
+                fn = lambda: s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Suspended"})  # noqa: E731
+                detail = "Suspend versioning (S3 can't return a bucket to 'never enabled')"
+            else:
+                out.append(RemediationAction(title, "skipped", "No automatic undo for this action; restore it manually from the saved configuration.", before, op or "", target))
+                continue
+            if dry_run:
+                out.append(RemediationAction(title, "planned", detail, before, op, target))
+                continue
+            try:
+                fn()
+                out.append(RemediationAction(title, "applied", detail, before, op, target))
+            except ClientError as exc:
+                out.append(RemediationAction(title, "failed", f"{detail} -> {_error_code(exc)}", before, op, target))
+        return out

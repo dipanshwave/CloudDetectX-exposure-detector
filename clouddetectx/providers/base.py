@@ -59,6 +59,26 @@ class StorageProvider(ABC):
         """iam.IamReport of who can access storage, or None if not supported for this cloud."""
         return None
 
+    def account_id(self) -> str:
+        """AWS account ID / Azure subscription ID / GCP project ID."""
+        return "default"
+
+    def account_checks(self) -> tuple[list[Finding], list[str], dict[str, str]]:
+        """Account-wide findings beyond storage: (findings, notes, errors per check area)."""
+        return [], [], {}
+
+    def list_accounts(self) -> list[dict]:
+        """Every account this login can scan: [{"id", "name"}] (Organizations / subscriptions / projects)."""
+        raise ProviderError(f"Multi-account scanning is not supported for {self.display_name}.")
+
+    def for_account(self, account_id: str) -> "StorageProvider":
+        """A provider bound to another account from list_accounts()."""
+        raise ProviderError(f"Multi-account scanning is not supported for {self.display_name}.")
+
+    def rollback(self, resource: Resource, applied: list[dict], dry_run: bool) -> list[RemediationAction]:
+        """Undo applied remediation actions (newest first) using the configuration saved before them."""
+        raise ProviderError(f"Rollback is not supported for {self.display_name}.")
+
     def probe_targets(self, posture: Posture, sample: list) -> list:
         """Public URLs (probe.ProbeTarget) to request anonymously."""
         return []

@@ -42,6 +42,7 @@ class Drift:
     previous_at: str | None
     new_public: list[str] = field(default_factory=list)
     resolved: list[str] = field(default_factory=list)
+    accepted: list[str] = field(default_factory=list)      # was public, now covered by a waiver
     new_resources: list[str] = field(default_factory=list)
     removed_resources: list[str] = field(default_factory=list)
     new_findings: dict[str, list[str]] = field(default_factory=dict)
@@ -49,7 +50,7 @@ class Drift:
 
     @property
     def changed(self) -> bool:
-        return bool(self.new_public or self.resolved or self.new_resources or self.removed_resources
+        return bool(self.new_public or self.resolved or self.accepted or self.new_resources or self.removed_resources
                      or self.new_findings or self.risk_increased)
 
     def to_dict(self) -> dict:
@@ -104,7 +105,7 @@ class History:
             if r["status"] == "public" and before["status"] != "public":
                 drift.new_public.append(name)
             if r["status"] != "public" and before["status"] == "public":
-                drift.resolved.append(name)
+                (drift.accepted if r["status"] == "accepted" else drift.resolved).append(name)
             added = sorted(set(r["checks"]) - before["checks"])
             if added:
                 drift.new_findings[name] = added

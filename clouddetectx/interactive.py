@@ -76,8 +76,7 @@ class InteractiveApp:
         self.results: dict[str, ScanResult] = {}
         self.investigations: dict[str, Investigation] = {}
         self.scanned_at: datetime | None = None
-        self.iam = None
-        self.iam_error: str | None = None
+        self.review = None            # account.AccountReview (IAM + account-wide checks)
         self._reconnect = False
 
     # ------------------------------------------------------------------ main loop
@@ -132,7 +131,7 @@ class InteractiveApp:
             Choice("Scan for public exposure", "do_scan"),
             Choice(browse, "do_browse"),
             Choice("Incident response: investigate and fix exposed resources", "do_respond"),
-            Choice("Identity & access: who can reach your storage (IAM)", "do_iam"),
+            Choice("Account & IAM: permissions, logging, network, databases, keys", "do_iam"),
             Choice("Compliance: pass rates, failing controls, compliance report", "do_compliance"),
             Choice("Scan history and drift", "do_history"),
             Choice("View incident reports", "do_reports"),
@@ -181,8 +180,9 @@ class InteractiveApp:
         self.provider_name, self.provider, self.account = name, provider, account
         self.engine = SecurityEngine(provider, self.settings)
         self.results, self.investigations, self.scanned_at = {}, {}, None
-        self.iam, self.iam_error = None, None
+        self.review = None
         console.print(f"[green]Connected:[/] {account}")
+        self._restore()
         return True
 
     # ------------------------------------------------------------------ settings
@@ -207,27 +207,49 @@ class InteractiveApp:
         self.provider = None
 
     # ------------------------------------------------------------------ scan / browse
+    def _restore(self) -> None:
+        """Load the last saved scan of this account (from the dashboard, CLI or a scheduled scan)."""
+        from clouddetectx import state
+
+        data = state.load(self.settings.data_dir, self.provider_name)
+        if not data or data.get("scope") != "account" or data.get("account") != self.account:
+            return
+        self.results = data.get("results") or {}
+        self.investigations = data.get("investigations") or {}
+        reviews = data.get("reviews") or {}
+        self.review = next(iter(reviews.values()), None)
+        scanned = data.get("scanned_at")
+        self.scanned_at = scanned.astimezone().replace(tzinfo=None) if scanned else None
+        for r in self.results.values():
+            self.engine.apply_waivers(r)
+        if self.review is not None:
+            self.engine.apply_account_waivers(self.review)
+        console.print(f"[dim]Loaded the last scan ({len(self.results)} resources, {_ago(self.scanned_at)}).[/]")
+
+    def _save(self, outcome=None) -> None:
+        from clouddetectx import state
+
+        state.save_scan(self.settings, self.provider_name, self.account, list(self.results.values()),
+                        {self.provider.account_id(): self.review}, outcome, investigations=self.investigations)
+
     def _scan(self) -> None:
         with console.status("Scanning...") as status:
             results = self.engine.scan(on_progress=lambda n: status.update(f"Scanning [bold]{n}[/]..."))
+            self.review = self.engine.review_account(on_progress=status.update)
         self.results = {r.posture.resource.name: r for r in results}
         self.scanned_at = datetime.now()
         outcome = after_scan(self.settings, self.provider_name, self.account, results, investigations=self.investigations)
-        from clouddetectx.cli import _identity
         from clouddetectx.overview import grade
 
-        self.iam, self.iam_error = _identity(self.provider)
         print_scan_table(self.provider_name, self.account, results, outcome.risks)
         print_outcome(outcome)
         if outcome.posture_score is not None:
             console.print(f"Grade: [bold]{grade(outcome.posture_score)}[/]")
-        if self.iam is not None:
-            c = self.iam.counts()
-            console.print(f"IAM: {c['principals']} principal(s) analysed, "
-                          + (f"[bold red]{c['risky']} flagged[/]" if c["risky"] else "[green]none flagged[/]")
-                          + " (menu: Identity & access)")
-        elif self.iam_error:
-            console.print(f"[yellow]IAM analysis skipped:[/] {self.iam_error}")
+        if self.review is not None:
+            n = len([f for f in self.review.findings if f.severity.rank >= 2])
+            console.print("Account-wide checks: " + (f"[bold red]{n} finding(s)[/]" if n else "[green]no medium+ findings[/]")
+                          + " (menu: Account & IAM)")
+        self._save(outcome)
 
     def do_scan(self) -> None:
         self._scan()
@@ -287,13 +309,21 @@ class InteractiveApp:
                 Choice("Remediate (shows plan first)", "remediate"),
                 Choice("Re-scan this resource", "rescan"),
                 Choice("Save assessment report", "report"),
+                Choice("Accept a risk (waiver) / remove waivers", "waive"),
                 Separator(),
                 Choice("Back", BACK),
             ])
             if action is None:
                 return
+            if action == "waive":
+                self._waive(name, result)
+                continue
             if action == "findings":
                 print_findings(result.all_findings, 0)
+                if result.accepted:
+                    console.print(f"[dim]Accepted by waiver ({len(result.accepted)}):[/]")
+                    for f in result.accepted:
+                        console.print(f"  [dim]{f.check_id} {f.title} - {f.waiver['reason']} (until {f.waiver['expires']})[/]")
                 print_risk(self.engine.risk(result, self.investigations.get(name)))
             elif action == "discover":
                 with console.status("Discovering sensitive data...") as st:
@@ -453,16 +483,46 @@ class InteractiveApp:
         console.print(f"Reports saved in [bold]{self.settings.reports_dir.resolve()}[/]")
 
     # ------------------------------------------------------------------ compliance & history
-    def do_iam(self) -> None:
-        from clouddetectx.cli import print_iam_summary
+    def _waive(self, name: str, result) -> None:
+        import questionary
 
-        if self.provider_name != "aws":
-            console.print("[dim]IAM analysis is available for AWS. Azure RBAC and GCP IAM are not analysed yet.[/]")
+        from clouddetectx.waivers import WaiverError
+
+        store = self.engine.waivers
+        existing = [w for w in store.all() if w.provider == self.provider_name and w.resource == name]
+        choices = [Choice(f"{f.check_id}  {f.title}", f.check_id) for f in result.all_findings if f.severity.rank >= 1]
+        choices += [Choice("Every check on this resource (*)", "*")]
+        choices += [Choice(f"Remove waiver {w.id}: {w.check_id} until {w.expires}", f"rm:{w.id}") for w in existing]
+        pick = _select("Accept which risk?", choices + [Separator(), Choice("Back", BACK)])
+        if not pick:
             return
+        if pick.startswith("rm:"):
+            store.remove(pick[3:])
+            console.print("[green]Waiver removed.[/]")
+        else:
+            reason = questionary.text("Why is this acceptable? (e.g. 'public website assets')").ask()
+            expires = questionary.text("Valid until (YYYY-MM-DD, max two years):").ask()
+            if not reason or not expires:
+                return
+            try:
+                w = store.add(self.provider_name, name, pick, reason, expires, os.getenv("USERNAME") or os.getenv("USER") or "")
+            except WaiverError as exc:
+                console.print(f"[red]{exc}[/]")
+                return
+            console.print(f"[green]Waiver {w.id} added until {w.expires}.[/]")
+        self.engine.apply_waivers(result)
+        self._save()
+
+    def do_iam(self) -> None:
+        from clouddetectx.cli import print_account_summary
+
         if not self.results:
             self._scan()
-        print_iam_summary(self.iam, self.iam_error, show_all=_confirm("List every principal (not only flagged ones)?", False))
-        for note in (self.iam.notes if self.iam else []):
+        if self.review is None:
+            console.print("[yellow]Account-wide checks are switched off (Settings > General).[/]")
+            return
+        print_account_summary(self.review, show_all=_confirm("List every principal and finding?", False))
+        for note in self.review.notes:
             console.print(f"[dim]{note}[/]")
 
     def do_compliance(self) -> None:
@@ -471,7 +531,7 @@ class InteractiveApp:
 
         if not self.results:
             self._scan()
-        data = compliance_data(self.provider_name, list(self.results.values()), self.iam)
+        data = compliance_data(self.provider_name, list(self.results.values()), self.review)
         summary = Table(title="Compliance summary", title_justify="left", expand=True)
         for col, just in (("Framework", "left"), ("Controls", "right"), ("Fully passing", "right"),
                           ("Resource-level pass rate", "right")):
@@ -508,7 +568,7 @@ class InteractiveApp:
         risks = {n: score_resource(r.findings, self.investigations.get(n), r.sensitive, r.proof)
                  for n, r in self.results.items()}
         data = build_compliance_report(self.provider_name, PROVIDERS[self.provider_name], self.account,
-                                       list(self.results.values()), risks, self.iam,
+                                       list(self.results.values()), risks, self.review,
                                        posture_score(list(risks.values())))
         md_path, _ = write_compliance_report(data, self.settings.reports_dir)
         console.print(f"[green]Compliance report saved:[/] {md_path}")
@@ -545,15 +605,46 @@ class InteractiveApp:
                        use_search_filter=True, use_jk_keys=False)
         if not path:
             return
-        action = _select(path.name, [
-            Choice("Show here in the terminal", "show"),
-            Choice("Open with the default app", "open"),
-            Choice("Back", BACK),
-        ])
+        options = [Choice("Show here in the terminal", "show"), Choice("Open with the default app", "open")]
+        if path.stem.startswith("INC-"):
+            options.append(Choice("Roll back this remediation (restores the saved configuration)", "rollback"))
+        action = _select(path.name, options + [Choice("Back", BACK)])
         if action == "show":
             console.print(Markdown(path.read_text(encoding="utf-8")))
         elif action == "open":
             self._open_file(path)
+        elif action == "rollback":
+            self._rollback(path)
+
+    def _rollback(self, md_path: Path) -> None:
+        import json
+
+        from clouddetectx.cli import print_actions
+        from clouddetectx.reporting import record_rollback
+
+        json_path = md_path.with_suffix(".json")
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        res = report.get("resource") or {}
+        if res.get("provider") != self.provider_name:
+            console.print(f"[yellow]This report is for {res.get('provider')}; switch cloud first.[/]")
+            return
+        try:
+            plan = self.engine.rollback(report, dry_run=True)
+        except ProviderError as exc:
+            console.print(f"[yellow]{exc}[/]")
+            return
+        print_actions(plan, "Rollback plan")
+        console.print("[bold yellow]This restores the configuration from before remediation; public access may come back.[/]")
+        typed = __import__("questionary").text(f"Type the resource name ({res.get('name')}) to roll back:").ask()
+        if (typed or "").strip() != res.get("name"):
+            console.print("Cancelled.")
+            return
+        actions = self.engine.rollback(report, dry_run=False)
+        print_actions(actions, "Rollback result")
+        record_rollback(json_path, md_path, actions)
+        if res.get("name") in self.results:
+            self.results[res["name"]] = self.engine.scan_one(res["name"])
+            self._save()
 
     @staticmethod
     def _open_file(path: Path) -> None:

@@ -225,7 +225,7 @@ def render_compliance_markdown(data: dict) -> str:
         f"| Account | {_md_escape(data['account'])} |",
         f"| Generated | {data['generated_at']} |",
         f"| Resources assessed | {len(data['resources'])} |",
-        f"| IAM permissions analysed | {'yes' if data['iam'] else 'no'} |",
+        f"| Account-wide checks | {'yes' if data.get('account_checked') else 'no'} |",
         f"| Security score | **{score}/100** (grade {data['grade']}) |" if score is not None else "| Security score | - |",
         "",
         "This report maps the latest scan's findings to security controls. It is evidence input for audits, "
@@ -289,7 +289,7 @@ def render_compliance_markdown(data: dict) -> str:
         c = iam["counts"]
         lines += ["", "## IAM permissions", "",
                   f"{c['principals']} principals analysed ({c['users']} users, {c['roles']} roles; "
-                  f"{iam['skipped_service_roles']} AWS service-linked roles skipped). {c['risky']} flagged.", ""]
+                  f"{iam['skipped_service_roles']} service-linked roles skipped). {c['risky']} flagged.", ""]
         flagged = [p for p in iam["principals"] if p["risky"]]
         if flagged:
             lines += ["| Principal | Type | Storage permissions | Console MFA | Keys over 90 days |", "|---|---|---|---|---|"]
@@ -309,17 +309,16 @@ def render_compliance_markdown(data: dict) -> str:
     return "\n".join(lines)
 
 
-def build_compliance_report(provider: str, provider_display: str, account: str, results: list, risks: dict,
-                            iam=None, security_score: int | None = None) -> dict:
+def build_compliance_report(provider: str, provider_display: str, account_label: str, results: list, risks: dict,
+                            account=None, security_score: int | None = None) -> dict:
     from datetime import datetime, timezone
 
-    from clouddetectx.overview import IAM_RESOURCE, categories, compliance, grade
+    from clouddetectx.overview import account_entries, categories, compliance, grade
 
     now = datetime.now(timezone.utc)
     by_check: dict[str, dict] = {}
     entries = [(r.posture.resource.name, r.all_findings) for r in results]
-    if iam is not None:
-        entries.append((IAM_RESOURCE, iam.findings))
+    entries += account_entries(account)
     for name, findings in entries:
         for f in findings:
             if f.severity.value == "INFO":
@@ -333,18 +332,20 @@ def build_compliance_report(provider: str, provider_display: str, account: str, 
     return {
         "report_id": f"CMP-{now:%Y%m%d-%H%M%S}-{provider}",
         "type": "compliance",
-        "provider": provider, "provider_display": provider_display, "account": account,
+        "provider": provider, "provider_display": provider_display, "account": account_label,
         "generated_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "security_score": security_score, "grade": grade(security_score),
-        "categories": categories(provider, results, iam),
-        "compliance": compliance(provider, results, iam),
+        "categories": categories(provider, results, account),
+        "compliance": compliance(provider, results, account),
+        "account_checked": account is not None,
+        "account_errors": account.errors if account is not None else {},
         "resources": [{
             "name": r.posture.resource.name, "status": r.status,
             "risk": risks[r.posture.resource.name].score if r.posture.resource.name in risks else None,
             "encryption": r.posture.config.get("encryption_summary"),
             "failing_checks": sorted({f.check_id for f in r.all_findings if f.severity.value != "INFO"}),
         } for r in results],
-        "iam": iam.to_dict() if iam is not None else None,
+        "iam": account.iam.to_dict() if account is not None and account.iam is not None else None,
         "findings": [{k: v for k, v in row.items() if k != "rank"}
                      for row in sorted(by_check.values(), key=lambda x: (-x["rank"], x["check_id"]))],
     }
@@ -357,3 +358,26 @@ def write_compliance_report(data: dict, reports_dir: Path) -> tuple[Path, Path]:
     md_path.write_text(render_compliance_markdown(data), encoding="utf-8")
     json_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
     return md_path, json_path
+
+
+def record_rollback(json_path: Path, md_path: Path, actions: list) -> dict:
+    """Record a rollback in an incident report (JSON + Markdown)."""
+    from datetime import datetime, timezone
+
+    failed = [a for a in actions if a.status == "failed"]
+    applied = [a for a in actions if a.status == "applied"]
+    status = "failed" if failed and not applied else "partial" if failed else "applied"
+    entry = {"status": status, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             "actions": [a.to_dict() for a in actions]}
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data["rollback"] = entry
+    if status == "applied":
+        data["status"] = "ROLLED_BACK"
+    json_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+    lines = ["", "## Rollback", "", f"Rolled back at {entry['at']} (status: **{status}**). The configuration saved "
+             "before remediation was restored; public access may be back.", "",
+             "| Status | Action | Detail |", "|---|---|---|"]
+    lines += [f"| {a.status} | {_md_escape(a.action)} | {_md_escape(a.detail)} |" for a in actions]
+    with md_path.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return entry

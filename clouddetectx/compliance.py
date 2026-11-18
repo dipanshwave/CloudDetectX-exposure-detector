@@ -48,6 +48,8 @@ AC2 = _c("NIST", "AC-2", "Account Management")
 AC6_5 = _c("NIST", "AC-6(5)", "Least Privilege | Privileged Accounts")
 IA2_1 = _c("NIST", "IA-2(1)", "Multi-factor Authentication to Privileged Accounts")
 IA5 = _c("NIST", "IA-5", "Authenticator Management")
+IA5_1 = _c("NIST", "IA-5(1)", "Authenticator Management | Password-Based Authentication")
+SC12 = _c("NIST", "SC-12", "Cryptographic Key Establishment and Management")
 
 CIS_3_3 = _c("CIS8", "3.3", "Configure Data Access Control Lists")
 CIS_3_2 = _c("CIS8", "3.2", "Establish and Maintain a Data Inventory")
@@ -60,6 +62,9 @@ CIS_11_2 = _c("CIS8", "11.2", "Perform Automated Backups")
 CIS_5_4 = _c("CIS8", "5.4", "Restrict Administrator Privileges to Dedicated Administrator Accounts")
 CIS_6_3 = _c("CIS8", "6.3", "Require MFA for Externally-Exposed Applications")
 CIS_6_8 = _c("CIS8", "6.8", "Define and Maintain Role-Based Access Control")
+CIS_4_4 = _c("CIS8", "4.4", "Implement and Manage a Firewall on Servers")
+CIS_5_2 = _c("CIS8", "5.2", "Use Unique Passwords")
+CIS_6_5 = _c("CIS8", "6.5", "Require MFA for Administrative Access")
 
 ISO_8_3 = _c("ISO", "A.8.3", "Information access restriction")
 ISO_8_9 = _c("ISO", "A.8.9", "Configuration management")
@@ -111,6 +116,44 @@ MAPPING: dict[str, tuple[Control, ...]] = {
     "GCP-GCS-005": (CM6, CIS_3_3, ISO_8_9, _c("CISB", "GCP 5.2", "Cloud Storage buckets have uniform bucket-level access enabled")),
     "GCP-GCS-006": LOGGING,
     "GCP-GCS-007": BACKUP,
+    # -- more storage checks
+    "AWS-S3-010": PUBLIC + (_c("CISB", "AWS", "S3 buckets are configured with 'Block public access'"),),
+    "AWS-S3-011": (AC3, SC7, CIS_3_3, ISO_8_3),
+    "AWS-S3-012": (CP9, ISO_8_13),
+    "AZ-ST-009": (IA5, ISO_5_17, _c("CISB", "Azure", "Shared Access Signature tokens expire within an hour")),
+    "AZ-ST-010": (IA5, ISO_5_17, _c("CISB", "Azure", "Storage account access keys are periodically regenerated")),
+    "AZ-ST-011": (SC7, ISO_8_20, _c("CISB", "Azure", "Private Endpoints are used to access Storage Accounts")),
+    "GCP-GCS-008": (IA5, ISO_5_17),
+    "GCP-GCS-009": (CP9, ISO_8_13),
+    # -- account-wide: AWS
+    "AWS-ACCT-001": LOGGING + (_c("CISB", "AWS", "CloudTrail is enabled in all regions"),),
+    "AWS-ACCT-002": (IA2_1, CIS_6_5, ISO_8_5, _c("CISB", "AWS", "MFA is enabled for the 'root' user account")),
+    "AWS-ACCT-003": (AC6_5, IA5, ISO_8_2, _c("CISB", "AWS", "No 'root' user account access key exists")),
+    "AWS-ACCT-004": (IA5_1, CIS_5_2, ISO_5_17, _c("CISB", "AWS", "IAM password policy requires minimum length of 14 or greater")),
+    "AWS-ACCT-005": (SC7, CIS_4_4, ISO_8_20, _c("CISB", "AWS", "No security groups allow ingress from 0.0.0.0/0 to remote server administration ports")),
+    "AWS-ACCT-006": (SC7, AC3, CIS_4_4, ISO_8_20, _c("CISB", "AWS", "RDS instances are not publicly accessible")),
+    "AWS-ACCT-007": PUBLIC,
+    "AWS-ACCT-008": (SC12, ISO_8_24, _c("CISB", "AWS", "Rotation for customer-created symmetric CMKs is enabled")),
+    "AWS-ACCT-009": (SC28, CIS_3_11, ISO_8_24, _c("CISB", "AWS", "EBS volume encryption is enabled in all regions")),
+    "AWS-ACCT-010": (SC7, CIS_4_4, ISO_8_20),
+    "AWS-ACCT-011": (CM6, CIS_4_1, ISO_8_9, _c("CISB", "AWS", "S3 buckets are configured with 'Block public access'")),
+    # -- account-wide: Azure
+    "AZ-ACCT-001": (SC7, CIS_4_4, ISO_8_20, _c("CISB", "Azure", "RDP/SSH access from the Internet is evaluated and restricted")),
+    "AZ-ACCT-002": (SC7, AC3, ISO_8_20, _c("CISB", "Azure", "No Azure SQL Databases allow ingress from 0.0.0.0/0 (ANY IP)")),
+    "AZ-ACCT-003": (SC7, CIS_4_4, ISO_8_20),
+    "AZ-ACCT-004": LOGGING + (_c("CISB", "Azure", "Diagnostic Setting exists for Subscription Activity Logs"),),
+    "AZ-IAM-001": (AC6_5, CIS_5_4, ISO_8_2),
+    "AZ-IAM-002": (AC6, CIS_6_8, ISO_5_15, ISO_5_18),
+    "AZ-IAM-003": (AC6, AC6_5, CIS_5_4, ISO_8_2, _c("CISB", "Azure", "No custom subscription administrator roles exist")),
+    # -- account-wide: GCP
+    "GCP-ACCT-001": (SC7, CIS_4_4, ISO_8_20, _c("CISB", "GCP", "SSH and RDP access is restricted from the internet")),
+    "GCP-ACCT-002": (SC7, AC3, ISO_8_20, _c("CISB", "GCP", "Cloud SQL database instances do not implicitly whitelist all public IP addresses")),
+    "GCP-ACCT-003": LOGGING + (_c("CISB", "GCP", "Cloud Audit Logging is configured properly"),),
+    "GCP-ACCT-004": (SC7, CIS_4_4, ISO_8_20),
+    "GCP-IAM-001": (AC6, AC6_5, CIS_5_4, ISO_8_2, _c("CISB", "GCP", "Service account has no admin privileges")),
+    "GCP-IAM-002": (AC6, CIS_6_8, ISO_5_15),
+    "GCP-IAM-003": (IA5, ISO_5_17, _c("CISB", "GCP", "User-managed keys for service accounts are rotated every 90 days or fewer")),
+    "GCP-IAM-004": PUBLIC,
     "DATA-001": (IA5_7, RA2, CIS_3_2, CIS_3_7, ISO_5_12, ISO_8_12),
     "DATA-002": (SC28, RA2, CIS_3_2, CIS_3_7, ISO_5_12, ISO_8_12),
 }
@@ -122,25 +165,38 @@ def controls_for(check_id: str) -> list[dict]:
 
 # Security categories shown on the dashboard. Account-level IAM checks start with AWS-IAM-.
 CATEGORIES = {
-    "public": ("Public access", ("AWS-S3-001", "AWS-S3-002", "AWS-S3-003", "AWS-S3-004", "AZ-ST-001", "AZ-ST-002",
-                                 "AZ-ST-003", "GCP-GCS-001", "GCP-GCS-002", "GCP-GCS-003", "GCP-GCS-004")),
-    "iam": ("Identity & access", ("AWS-S3-009", "AZ-ST-004", "GCP-GCS-005", "AWS-IAM-001", "AWS-IAM-002",
-                                  "AWS-IAM-003", "AWS-IAM-004", "AWS-IAM-005")),
-    "encryption": ("Encryption", ("AWS-S3-006", "AWS-S3-008", "AZ-ST-005", "AZ-ST-006")),
-    "logging": ("Logging", ("AWS-S3-005", "AZ-ST-007", "GCP-GCS-006")),
-    "backup": ("Backup & recovery", ("AWS-S3-007", "AZ-ST-008", "GCP-GCS-007")),
+    "public": ("Public access", ("AWS-S3-001", "AWS-S3-002", "AWS-S3-003", "AWS-S3-004", "AWS-S3-010", "AWS-S3-011",
+                                 "AWS-ACCT-011", "AZ-ST-001", "AZ-ST-002", "AZ-ST-003", "GCP-GCS-001", "GCP-GCS-002",
+                                 "GCP-GCS-003", "GCP-GCS-004", "GCP-IAM-004")),
+    "iam": ("Identity & access", ("AWS-S3-009", "AZ-ST-004", "AZ-ST-009", "AZ-ST-010", "GCP-GCS-005", "GCP-GCS-008",
+                                  "AWS-IAM-001", "AWS-IAM-002", "AWS-IAM-003", "AWS-IAM-004", "AWS-IAM-005",
+                                  "AWS-ACCT-002", "AWS-ACCT-003", "AWS-ACCT-004", "AZ-IAM-001", "AZ-IAM-002",
+                                  "AZ-IAM-003", "GCP-IAM-001", "GCP-IAM-002", "GCP-IAM-003")),
+    "network": ("Network exposure", ("AWS-ACCT-005", "AWS-ACCT-010", "AZ-ST-011", "AZ-ACCT-001", "AZ-ACCT-003",
+                                     "GCP-ACCT-001", "GCP-ACCT-004")),
+    "databases": ("Databases & snapshots", ("AWS-ACCT-006", "AWS-ACCT-007", "AZ-ACCT-002", "GCP-ACCT-002")),
+    "encryption": ("Encryption", ("AWS-S3-006", "AWS-S3-008", "AWS-ACCT-008", "AWS-ACCT-009", "AZ-ST-005", "AZ-ST-006")),
+    "logging": ("Logging", ("AWS-S3-005", "AWS-ACCT-001", "AZ-ST-007", "AZ-ACCT-004", "GCP-GCS-006", "GCP-ACCT-003")),
+    "backup": ("Backup & recovery", ("AWS-S3-007", "AWS-S3-012", "AZ-ST-008", "GCP-GCS-007", "GCP-GCS-009")),
     "data": ("Sensitive data", ("DATA-001", "DATA-002")),
 }
 CHECK_CATEGORY = {cid: key for key, (_, ids) in CATEGORIES.items() for cid in ids}
 PROVIDER_PREFIX = {"aws": "AWS-S3-", "azure": "AZ-ST-", "gcp": "GCP-GCS-"}
+ACCOUNT_PREFIXES = {"aws": ("AWS-ACCT-", "AWS-IAM-"), "azure": ("AZ-ACCT-", "AZ-IAM-"), "gcp": ("GCP-ACCT-", "GCP-IAM-")}
+ACCOUNT_LEVEL_EXTRA = {"GCP-GCS-008"}      # storage-related but account-wide (HMAC keys)
 
 
-def evaluated_checks(provider: str, identity_checked: bool, data_checked: bool) -> list[str]:
+def is_account_level(check_id: str) -> bool:
+    return check_id in ACCOUNT_LEVEL_EXTRA or "-ACCT-" in check_id or "-IAM-" in check_id
+
+
+def evaluated_checks(provider: str, account_checked: bool, data_checked: bool) -> list[str]:
     """Check IDs that a scan of this provider actually evaluates."""
     prefix = PROVIDER_PREFIX[provider]
-    ids = [c for c in MAPPING if c.startswith(prefix)]
-    if identity_checked and provider == "aws":
-        ids += [c for c in MAPPING if c.startswith("AWS-IAM-")]
+    ids = [c for c in MAPPING if c.startswith(prefix) and not is_account_level(c)]
+    if account_checked:
+        ids += [c for c in MAPPING if c.startswith(ACCOUNT_PREFIXES[provider]) or
+                (c in ACCOUNT_LEVEL_EXTRA and c.startswith(prefix))]
     if data_checked:
         ids += ["DATA-001", "DATA-002"]
     return ids

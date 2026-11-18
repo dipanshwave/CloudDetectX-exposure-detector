@@ -30,6 +30,7 @@ class Resource:
     location: str | None = None
     kind: str = "bucket"   # bucket | storage-account
     extra: dict[str, Any] = field(default_factory=dict)  # e.g. Azure resource group
+    account: str | None = None   # AWS account ID / Azure subscription ID / GCP project ID
 
 
 @dataclass
@@ -51,6 +52,7 @@ class Finding:
     # True when this misconfiguration currently lets the public reach data.
     exposes_data: bool = False
     evidence: dict[str, Any] = field(default_factory=dict)
+    waiver: dict[str, Any] | None = None   # set when an accepted-risk waiver covers this finding
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -144,6 +146,8 @@ class RemediationAction:
     status: str               # planned | applied | skipped | failed
     detail: str
     before: Any = None        # original configuration, kept for rollback
+    op: str = ""              # machine-readable operation, used by rollback (e.g. "s3.put_public_access_block")
+    target: str = ""          # object key / container name the operation applied to, if any
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

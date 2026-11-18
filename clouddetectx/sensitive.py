@@ -7,6 +7,7 @@ printed or written to reports.
 
 from __future__ import annotations
 
+import io
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
@@ -157,11 +158,104 @@ FILENAME_RULES: tuple[tuple[re.Pattern, str, str, Severity], ...] = (
 )
 
 BINARY_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".ico", ".svg", ".mp4", ".mov", ".avi", ".mkv", ".mp3",
-              ".wav", ".flac", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".pdf", ".docx", ".xlsx", ".pptx",
-              ".woff", ".woff2", ".ttf", ".otf", ".exe", ".dll", ".so", ".dylib", ".bin", ".iso", ".parquet", ".avro"}
+              ".wav", ".flac", ".bz2", ".xz", ".7z", ".rar",
+              ".woff", ".woff2", ".ttf", ".otf", ".exe", ".dll", ".so", ".dylib", ".bin", ".iso", ".avro"}
+# Read whole (up to the document size limit) and converted to text before scanning.
+DOCUMENT_EXT = {".pdf", ".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".zip", ".jar", ".gz", ".tgz", ".parquet"}
+MAX_EXTRACTED_CHARS = 4 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 500
+MAX_UNCOMPRESSED = 64 * 1024 * 1024
 TEXT_EXT = {".env", ".txt", ".csv", ".json", ".yml", ".yaml", ".xml", ".ini", ".cfg", ".conf", ".config", ".properties",
             ".sql", ".log", ".md", ".py", ".js", ".ts", ".php", ".rb", ".go", ".java", ".sh", ".ps1", ".tf", ".tfstate",
             ".tfvars", ".pem", ".key", ".html", ".htm", ".toml"}
+
+
+def _xml_text(xml: bytes) -> str:
+    text = re.sub(rb"<[^>]+>", b" ", xml).decode("utf-8", errors="replace")
+    return re.sub(r"[ \t]+", " ", text)
+
+
+def _zip_members(data: bytes, prefix: str, risky_names: list[str]) -> str:
+    import zipfile
+
+    out, total = [], 0
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()][:MAX_ARCHIVE_MEMBERS]
+        for info in infos:
+            risky_names.append(f"{prefix}!/{info.filename}")
+            ext = PurePosixPath(info.filename.lower()).suffix
+            if ext not in TEXT_EXT and ext != "":
+                continue
+            if info.file_size > 2 * 1024 * 1024 or total + info.file_size > MAX_UNCOMPRESSED:
+                continue                     # zip-bomb guard: never inflate more than the budget
+            total += info.file_size
+            with zf.open(info) as fh:
+                out.append(fh.read(2 * 1024 * 1024).decode("utf-8", errors="replace"))
+    return "\n".join(out)
+
+
+def _ooxml(data: bytes) -> str:
+    import zipfile
+
+    out, total = [], 0
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist()[:MAX_ARCHIVE_MEMBERS]:
+            name = info.filename
+            if not name.endswith(".xml") or not name.startswith(("word/", "xl/", "ppt/")):
+                continue
+            if total + info.file_size > MAX_UNCOMPRESSED:
+                break
+            total += info.file_size
+            with zf.open(info) as fh:
+                out.append(_xml_text(fh.read(8 * 1024 * 1024)))
+    return "\n".join(out)
+
+
+def extract_text(key: str, data: bytes, risky_names: list[str]) -> tuple[str | None, str | None]:
+    """Text content of a document/archive. Returns (text, note). risky_names collects archive member names."""
+    ext = PurePosixPath(key.lower()).suffix
+    try:
+        if ext == ".pdf":
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(data))
+            if reader.is_encrypted:
+                return None, f"{key}: encrypted PDF not scanned"
+            return "\n".join((page.extract_text() or "") for page in reader.pages[:200]), None
+        if ext in (".docx", ".xlsx", ".pptx", ".docm", ".xlsm"):
+            return _ooxml(data), None
+        if ext in (".zip", ".jar"):
+            return _zip_members(data, key, risky_names), None
+        if ext in (".gz", ".tgz"):
+            import gzip
+            import tarfile
+
+            raw = gzip.GzipFile(fileobj=io.BytesIO(data)).read(MAX_UNCOMPRESSED)
+            inner = key[:-3] if ext == ".gz" else key[:-4] + ".tar"
+            if inner.lower().endswith(".tar"):
+                out = []
+                with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+                    for m in tf.getmembers()[:MAX_ARCHIVE_MEMBERS]:
+                        if not m.isfile():
+                            continue
+                        risky_names.append(f"{key}!/{m.name}")
+                        if PurePosixPath(m.name.lower()).suffix in TEXT_EXT and m.size <= 2 * 1024 * 1024:
+                            fh = tf.extractfile(m)    # read into memory only; nothing is written to disk
+                            if fh:
+                                out.append(fh.read().decode("utf-8", errors="replace"))
+                return "\n".join(out), None
+            return raw.decode("utf-8", errors="replace"), None
+        if ext == ".parquet":
+            try:
+                import pyarrow.parquet as pq
+            except ImportError:
+                return None, "Parquet files need pyarrow (pip install pyarrow)"
+            table = pq.read_table(io.BytesIO(data))
+            rows = table.slice(0, 5000).to_pylist()
+            return "\n".join(" ".join(str(v) for v in row.values() if v is not None) for row in rows), None
+    except Exception as exc:  # noqa: BLE001 - corrupt or unsupported file
+        return None, f"{key}: could not extract text ({type(exc).__name__})"
+    return None, None
 
 
 def redact(value: str, detector_id: str) -> str:
@@ -248,6 +342,7 @@ def discover(
     max_total_bytes: int,
     on_progress: Callable[[str], None] | None = None,
     notes: list[str] | None = None,
+    max_file_bytes: int = 20 * 1024 * 1024,
 ) -> SensitiveReport:
     candidates = list(candidates)
     chosen = sorted(candidates, key=_priority)[:max_objects]
@@ -257,17 +352,27 @@ def discover(
     scanned = skipped = total = 0
     exhausted = False
 
+    def check_name(display: str, size):
+        for rx, desc, cat, sev in FILENAME_RULES:
+            if rx.search(display.rsplit("!/", 1)[-1]):
+                risky.append({"key": display, "reason": desc, "category": cat, "severity": sev.value, "size": size})
+                return
+
     # Filename rules run on every listed object (no data read needed).
     for obj in candidates:
-        for rx, desc, cat, sev in FILENAME_RULES:
-            if rx.search(obj.key):
-                risky.append({"key": obj.display, "reason": desc, "category": cat, "severity": sev.value, "size": obj.size})
-                break
+        check_name(obj.display, obj.size)
 
+    documents = 0
     for i, obj in enumerate(chosen, 1):
         ext = PurePosixPath(obj.key.lower()).suffix
         if ext in BINARY_EXT or obj.size == 0:
             skipped += 1
+            continue
+        is_doc = ext in DOCUMENT_EXT
+        if is_doc and (obj.size or 0) > max_file_bytes:
+            skipped += 1
+            if len(notes) < 20:
+                notes.append(f"Skipped {obj.display}: {obj.size // (1024 * 1024)} MB is over the document size limit.")
             continue
         if total >= max_total_bytes:
             exhausted = True
@@ -275,18 +380,34 @@ def discover(
         if on_progress and (i == 1 or i % 10 == 0):
             on_progress(f"Inspecting object {i}/{len(chosen)}: {obj.display}")
         try:
-            data = read(obj, min(max_bytes, max_total_bytes - total))
+            data = read(obj, min(max_file_bytes if is_doc else max_bytes, max_total_bytes - total))
         except Exception as exc:  # noqa: BLE001 - one unreadable object must not stop discovery
             skipped += 1
             if len(notes) < 20:
                 notes.append(f"Could not read {obj.display}: {type(exc).__name__}")
             continue
         total += len(data)
-        if b"\x00" in data[:2048]:
-            skipped += 1
-            continue
+        if is_doc:
+            if obj.size and len(data) < obj.size:
+                skipped += 1        # read budget cut the file short; documents can't be parsed partially
+                continue
+            members: list[str] = []
+            text, note = extract_text(obj.key, data, members)
+            for m in members:
+                check_name(m.replace(obj.key, obj.display, 1), None)
+            if note and len(notes) < 20:
+                notes.append(note)
+            if text is None:
+                skipped += 1
+                continue
+            documents += 1
+            text = text[:MAX_EXTRACTED_CHARS]
+        else:
+            if b"\x00" in data[:2048]:
+                skipped += 1
+                continue
+            text = data.decode("utf-8", errors="replace")
         scanned += 1
-        text = data.decode("utf-8", errors="replace")
         for det in DETECTORS:
             for m in det.pattern.finditer(text):
                 value = m.group(0)
@@ -315,5 +436,7 @@ def discover(
         report.notes.append("Read budget reached; not every sampled object was inspected (Settings > Sensitive data discovery).")
     if len(candidates) > max_objects:
         report.notes.append(f"Sampled {max_objects} of {len(candidates)} listed objects, prioritising risky names and text files.")
-    report.notes.append("Binary formats (images, archives, PDF, Office files) are not content-scanned.")
+    if documents:
+        report.notes.append(f"{documents} document(s)/archive(s) (PDF, Office, zip, gzip, Parquet) were converted to text and scanned.")
+    report.notes.append("Images, video, audio, executables, 7z/rar archives and Avro files are not content-scanned.")
     return report

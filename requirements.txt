@@ -1,13 +1,23 @@
+# Runtime dependencies, pinned to the versions CloudDetectX is tested with.
+# Install: pip install -r requirements.txt   (or: pip install .)
+
 # Core
 rich==15.0.0
 questionary==2.1.1
 python-dotenv==1.2.4
+keyring==25.7.0
+requests==2.34.2
 
-# Web dashboard
+# Web dashboard and reports
 fastapi==0.163.1
 uvicorn==0.54.0
 markdown==3.11.3
 nh3==0.3.7
+fpdf2==2.9.0
+
+# Sensitive-data discovery in documents
+pypdf==7.1.0
+pyarrow==26.0.1
 
 # AWS
 boto3==1.44.4

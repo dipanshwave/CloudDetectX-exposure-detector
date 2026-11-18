@@ -13,6 +13,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+KEY_MAX_AGE_DAYS = 90
+
 from clouddetectx.config import Settings
 from clouddetectx.models import AccessEvent, ChangeEvent, Finding, Posture, RemediationAction, Resource, Severity
 from clouddetectx.providers.base import ProviderError, StorageProvider
@@ -51,14 +53,14 @@ class AzureProvider(StorageProvider):
     name = "azure"
     display_name = "Microsoft Azure (Blob Storage)"
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, subscription_id: str | None = None):
         try:
             from azure.identity import DefaultAzureCredential
             from azure.mgmt.storage import StorageManagementClient
         except ImportError as exc:  # pragma: no cover
             raise ProviderError("Azure SDK is not installed. Run: pip install -r requirements.txt") from exc
 
-        if not settings.azure_subscription_id:
+        if not (subscription_id or settings.azure_subscription_id):
             raise ProviderError(
                 "AZURE_SUBSCRIPTION_ID is not set. Find it with `az account show --query id -o tsv` "
                 "and add it to .env."
@@ -68,7 +70,7 @@ class AzureProvider(StorageProvider):
         # The SDK logs verbose credential-chain warnings; we surface a clear error ourselves.
         logging.getLogger("azure").setLevel(logging.ERROR)
         self.settings = settings
-        self.subscription_id = settings.azure_subscription_id
+        self.subscription_id = subscription_id or settings.azure_subscription_id
         self.credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
         self.storage = StorageManagementClient(self.credential, self.subscription_id)
         self._accounts: dict[str, Any] | None = None
@@ -87,6 +89,34 @@ class AzureProvider(StorageProvider):
         self._load_accounts()
         return f"Azure subscription {self.subscription_id}"
 
+    def account_id(self) -> str:
+        return self.subscription_id
+
+    def list_accounts(self) -> list[dict]:
+        from clouddetectx.checks.rest import ArmClient, RestError
+
+        try:
+            subs = ArmClient(self.credential).list("/subscriptions", "2022-12-01")
+        except RestError as exc:
+            raise ProviderError(f"Cannot list Azure subscriptions: {exc}") from exc
+        return [{"id": s["subscriptionId"], "name": s.get("displayName") or s["subscriptionId"]}
+                for s in subs if s.get("state") == "Enabled"]
+
+    def for_account(self, account_id: str) -> "AzureProvider":
+        if account_id == self.subscription_id:
+            return self
+        return AzureProvider(self.settings, subscription_id=account_id)
+
+    def account_checks(self):
+        from clouddetectx.checks import azure_account
+
+        return azure_account.run(self)
+
+    def analyze_identity(self):
+        from clouddetectx.checks import azure_account
+
+        return azure_account.analyze_identity(self)
+
     # -- discovery ---------------------------------------------------------------
     def _load_accounts(self) -> dict[str, Any]:
         if self._accounts is None:
@@ -102,6 +132,7 @@ class AzureProvider(StorageProvider):
             location=account.location,
             kind="storage-account",
             extra={"resource_group": _resource_group(account.id)},
+            account=self.subscription_id,
         )
 
     def list_resources(self) -> list[Resource]:
@@ -136,7 +167,21 @@ class AzureProvider(StorageProvider):
             "https_only": acct.enable_https_traffic_only,
             "minimum_tls_version": _enum(acct.minimum_tls_version),
             "allow_shared_key_access": acct.allow_shared_key_access,
+            "sas_expiration_period": getattr(acct.sas_policy, "sas_expiration_period", None) if acct.sas_policy else None,
+            "key_expiration_days": getattr(acct.key_policy, "key_expiration_period_in_days", None) if acct.key_policy else None,
+            "key_ages_days": [
+                (datetime.now(timezone.utc) - (t if t.tzinfo else t.replace(tzinfo=timezone.utc))).days
+                for t in (getattr(acct.key_creation_time, "key1", None), getattr(acct.key_creation_time, "key2", None)) if t
+            ] if getattr(acct, "key_creation_time", None) else [],
+            "private_endpoints": len(acct.private_endpoint_connections or []),
+            "encryption_key_source": _enum(acct.encryption.key_source) if acct.encryption else None,
         })
+        cfg["encryption_summary"] = {
+            "at_rest": "Customer-managed key (Key Vault)" if cfg["encryption_key_source"] == "Microsoft.Keyvault"
+            else "Microsoft-managed keys",
+            "kms_key": None, "bucket_key": None,
+            "in_transit_enforced": acct.enable_https_traffic_only is not False,
+        }
 
         containers = []
         try:
@@ -248,6 +293,26 @@ class AzureProvider(StorageProvider):
                 description="Without StorageRead logs you cannot prove whether exposed blobs were downloaded.",
                 recommendation="Add a diagnostic setting on blobServices/default sending StorageRead/Write/Delete to Log Analytics.",
             ))
+
+        shared_key = cfg.get("allow_shared_key_access") is not False
+        if shared_key and not cfg.get("sas_expiration_period"):
+            findings.append(Finding(
+                "AZ-ST-009", "No SAS expiration policy", Severity.LOW,
+                "Shared access signatures can be issued with any lifetime, including years, and can't be listed or revoked "
+                "individually (only by rotating the account key).",
+                "Set a SAS expiration policy (e.g. 1 day) or disable shared key access."))
+        old = [d for d in cfg.get("key_ages_days", []) if d > KEY_MAX_AGE_DAYS]
+        if shared_key and old:
+            findings.append(Finding(
+                "AZ-ST-010", f"Account keys not rotated in {KEY_MAX_AGE_DAYS} days", Severity.MEDIUM,
+                f"Storage account key(s) are {max(old)} days old. Anyone who ever copied a key or a key-signed SAS still has access.",
+                "Rotate both keys (or disable shared key access) and set a key expiration policy.",
+                evidence={"key_ages_days": cfg.get("key_ages_days")}))
+        if cfg.get("public_network_access") != "Disabled" and not cfg.get("private_endpoints"):
+            findings.append(Finding(
+                "AZ-ST-011", "No private endpoint; reachable over the public endpoint", Severity.INFO,
+                "All clients reach this account over its public endpoint (firewall rules still apply).",
+                "Add a private endpoint and disable public network access where possible."))
 
         if cfg.get("versioning") is False and cfg.get("soft_delete") is False:
             findings.append(Finding("AZ-ST-008", "Blob versioning and soft delete are disabled", Severity.LOW,
@@ -416,15 +481,15 @@ class AzureProvider(StorageProvider):
         account = posture.resource.name
         actions: list[RemediationAction] = []
 
-        def run(action: str, detail: str, before: Any, fn):
+        def run(action: str, detail: str, before: Any, fn, op: str = "", target: str = ""):
             if dry_run:
-                actions.append(RemediationAction(action, "planned", detail, before))
+                actions.append(RemediationAction(action, "planned", detail, before, op, target))
                 return
             try:
                 fn()
-                actions.append(RemediationAction(action, "applied", detail, before))
+                actions.append(RemediationAction(action, "applied", detail, before, op, target))
             except AzureError as exc:
-                actions.append(RemediationAction(action, "failed", f"{detail} -> {exc}", before))
+                actions.append(RemediationAction(action, "failed", f"{detail} -> {exc}", before, op, target))
 
         # 1. Containment: disallowing anonymous access at the account overrides every container instantly.
         if cfg.get("allow_blob_public_access") is not False:
@@ -432,7 +497,7 @@ class AzureProvider(StorageProvider):
                 f"allowBlobPublicAccess=false on {account}",
                 {"allow_blob_public_access": cfg.get("allow_blob_public_access")},
                 lambda: self.storage.storage_accounts.update(
-                    rg, account, StorageAccountUpdateParameters(allow_blob_public_access=False)))
+                    rg, account, StorageAccountUpdateParameters(allow_blob_public_access=False)), "azure.public_access")
 
         # 2. Make each public container private so the exposure doesn't return if the account flag is flipped back.
         for c in cfg.get("containers", []):
@@ -441,7 +506,7 @@ class AzureProvider(StorageProvider):
                     f"publicAccess None (was {c['public_access']})",
                     {"public_access": c["public_access"]},
                     lambda name=c["name"]: self.storage.blob_containers.update(
-                        rg, account, name, BlobContainer(public_access="None")))
+                        rg, account, name, BlobContainer(public_access="None")), "azure.container_access", c["name"])
 
         if harden:
             if cfg.get("https_only") is False or cfg.get("minimum_tls_version") not in (None, "TLS1_2", "TLS1_3"):
@@ -449,8 +514,46 @@ class AzureProvider(StorageProvider):
                     {"https_only": cfg.get("https_only"), "minimum_tls_version": cfg.get("minimum_tls_version")},
                     lambda: self.storage.storage_accounts.update(
                         rg, account, StorageAccountUpdateParameters(
-                            enable_https_traffic_only=True, minimum_tls_version="TLS1_2")))
+                            enable_https_traffic_only=True, minimum_tls_version="TLS1_2")), "azure.https_tls")
 
         if not actions:
             actions.append(RemediationAction("No change required", "skipped", "No anonymous access to remove."))
         return actions
+
+    def rollback(self, resource: Resource, applied: list[dict], dry_run: bool):
+        from azure.core.exceptions import AzureError
+        from azure.mgmt.storage.models import BlobContainer, StorageAccountUpdateParameters
+
+        rg, account = resource.extra["resource_group"], resource.name
+        out: list[RemediationAction] = []
+        for a in applied:
+            op, before, target = a.get("op"), a.get("before") or {}, a.get("target") or ""
+            title = f"Undo: {a.get('action')}"
+            if op == "azure.public_access":
+                value = before.get("allow_blob_public_access")
+                value = True if value is None else value      # None = legacy default (allowed)
+                fn = lambda v=value: self.storage.storage_accounts.update(  # noqa: E731
+                    rg, account, StorageAccountUpdateParameters(allow_blob_public_access=v))
+                detail = f"allowBlobPublicAccess={value}"
+            elif op == "azure.container_access":
+                level = before.get("public_access") or "None"
+                fn = lambda c=target, lv=level: self.storage.blob_containers.update(  # noqa: E731
+                    rg, account, c, BlobContainer(public_access=lv))
+                detail = f"Container '{target}' publicAccess={level}"
+            elif op == "azure.https_tls":
+                fn = lambda b=before: self.storage.storage_accounts.update(rg, account, StorageAccountUpdateParameters(  # noqa: E731
+                    enable_https_traffic_only=b.get("https_only") if b.get("https_only") is not None else True,
+                    minimum_tls_version=b.get("minimum_tls_version") or "TLS1_0"))
+                detail = "Restore previous HTTPS/TLS settings"
+            else:
+                out.append(RemediationAction(title, "skipped", "No automatic undo for this action.", before, op or "", target))
+                continue
+            if dry_run:
+                out.append(RemediationAction(title, "planned", detail, before, op, target))
+                continue
+            try:
+                fn()
+                out.append(RemediationAction(title, "applied", detail, before, op, target))
+            except AzureError as exc:
+                out.append(RemediationAction(title, "failed", f"{detail} -> {exc}", before, op, target))
+        return out
